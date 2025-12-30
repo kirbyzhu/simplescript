@@ -153,13 +153,17 @@ uninstall_reality() {
     fi
 }
 
-# 脚本入口修改
+# 脚本入口逻辑
 clear
-num=$(show_menu)  # 获取返回值
-case "$num" in
-    1) install_reality ;;
-    2) show_config ;;
-    3) uninstall_reality ;;
-    0) exit 0 ;;
-    *) echo -e "${red}无效输入${plain}" ;;
-esac
+show_menu
+if [ "$num" == "1" ]; then
+    install_reality
+elif [ "$num" == "2" ]; then
+    show_config
+elif [ "$num" == "3" ]; then
+    uninstall_reality
+elif [ "$num" == "0" ]; then
+    exit 0
+else
+    echo -e "${red}无效输入${plain}"
+fi
