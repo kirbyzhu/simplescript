@@ -10,7 +10,7 @@ red='\033[0;31m'
 
 show_menu() {
     echo -e "
-  ${green}Reality + Caddy 一键管理脚本${plain}
+  ${green}Reality + Caddy (Let's Encrypt) 一键管理脚本${plain}
   --- 自动申请证书 + 自建伪装站 ---
   ${green}1.${plain} 安装 Reality 环境 (Caddy + Xray)
   ${green}2.${plain} 查看客户端配置信息
@@ -34,19 +34,25 @@ install_reality() {
 
     # 4. 获取用户输入
     read -p "请输入你的解析域名 (例如 myweb.com): " MY_DOMAIN
-    read -p "请输入你的邮箱 (用于自动申请SSL证书): " MY_EMAIL
+    read -p "请输入你的邮箱 (用于 Let's Encrypt 证书申请): " MY_EMAIL
     
     V_UUID=$(uuidgen)
+    # 获取密钥对
     PRIV_KEY=$(xray x25519 | grep "Private key" | awk '{print $3}')
     PUB_KEY=$(xray x25519 -i "$PRIV_KEY" | grep "Public key" | awk '{print $3}')
     SHORT_ID=$(openssl rand -hex 8)
 
-    # 5. 配置 Caddy 伪装网站 (监听 8080，避免与 Xray 冲突)
-    # 下载一个美观的静态 HTML 模板
+    # 5. 配置 Caddy 伪装网站
     mkdir -p /var/www/html
     curl -L https://github.com/cloud-annotations/docusaurus-template/archive/refs/heads/main.tar.gz | tar -xz -C /var/www/html --strip-components=1
 
+    # 编写 Caddyfile，强制使用 Let's Encrypt
     cat <<EOF > /etc/caddy/Caddyfile
+{
+    email $MY_EMAIL
+    cert_issuer acme
+}
+
 $MY_DOMAIN {
     reverse_proxy 127.0.0.1:8080
 }
@@ -59,7 +65,6 @@ EOF
     systemctl restart caddy
 
     # 6. 配置 Xray
-    # 注意：Reality 监听 443，遇到非代理流量转发给 Caddy 的 8080 端口
     cat <<EOF > /usr/local/etc/xray/config.json
 {
     "inbounds": [{
@@ -96,7 +101,7 @@ EOF
 
     systemctl restart xray
     systemctl enable xray
-    echo -e "${green}安装完成！Caddy 正在为你自动申请 SSL 证书，请稍候...${plain}"
+    echo -e "${green}安装完成！Caddy 正在通过 Let's Encrypt 申请证书，请确保 80 端口未被占用且域名解析已生效。${plain}"
     show_config
 }
 
@@ -117,7 +122,6 @@ UUID: ${UUID}
 SNI: ${DOMAIN}
 PublicKey: ${PUBKEY}
 ShortId: ${SID}
-传输/安全: TCP + Reality
 
 ${green}========== 客户端 JSON (直接复制) ==========${plain}
 "
@@ -148,7 +152,7 @@ EOF
 }
 
 uninstall_reality() {
-    read -p "确定要彻底卸载 Caddy 和 Xray 吗？(y/n): " confirm
+    read -p "确定要彻底卸载吗？(y/n): " confirm
     if [[ "$confirm" == "y" ]]; then
         systemctl stop xray caddy
         systemctl disable xray caddy
@@ -159,13 +163,23 @@ uninstall_reality() {
     fi
 }
 
-# 脚本入口
+# 脚本入口逻辑
 clear
 show_menu
-case $num in
-    1) install_reality ;;
-    2) show_config ;;
-    3) uninstall_reality ;;
-    0) exit 0 ;;
-    *) echo -e "${red}请输入正确数字${plain}" ;;
+case "$num" in
+    1)
+        install_reality
+        ;;
+    2)
+        show_config
+        ;;
+    3)
+        uninstall_reality
+        ;;
+    0)
+        exit 0
+        ;;
+    *)
+        echo -e "${red}请输入正确数字${plain}"
+        ;;
 esac
