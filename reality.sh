@@ -4,9 +4,9 @@
 [[ $EUID -ne 0 ]] && echo "请以root用户运行此脚本" && exit 1
 
 # 颜色定义
-green='[0;32m'
-plain='[0m'
-red='[0;31m'
+green='\033[0;32m'
+plain='\033[0m'
+red='\033[0;31m'
 
 show_menu() {
     echo -e "
@@ -17,12 +17,11 @@ show_menu() {
   ${green}3.${plain} ${red}一键卸载 Reality${plain}
   ${green}0.${plain} 退出脚本
 "
-    read -p "请输入数字选择: " num
 }
 
 install_reality() {
     # 1. 环境准备
-    apt update && apt install -y curl debian-keyring debian-archive-keyring apt-transport-https uuid-runtime openssl tar
+    apt update && apt install -y curl debian-keyring debian-archive-keyring apt-transport-https uuid-runtime openssl tar || { echo "${red}环境准备失败${plain}"; exit 1; }
 
     # 2. 安装 Caddy
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -35,7 +34,7 @@ install_reality() {
     # 4. 获取用户输入
     read -p "请输入你的解析域名 (例如 myweb.com): " MY_DOMAIN
     read -p "请输入你的邮箱 (用于 Let's Encrypt): " MY_EMAIL
-
+    
     V_UUID=$(uuidgen)
     PRIV_KEY=$(xray x25519 | grep "Private key" | awk '{print $3}')
     PUB_KEY=$(xray x25519 -i "$PRIV_KEY" | grep "Public key" | awk '{print $3}')
@@ -54,7 +53,7 @@ $MY_DOMAIN {
     # 强制使用 Let's Encrypt
     tls {
         issuer acme {
-            dir https://acme-v02.api.letsencrypt.org/directory
+            dir "https://acme-v02.api.letsencrypt.org/directory"
         }
     }
     reverse_proxy 127.0.0.1:8080
@@ -156,9 +155,10 @@ uninstall_reality() {
     fi
 }
 
-# 脚本入口
+# 脚本入口 - 已修复变量作用域问题
 clear
 show_menu
+read -p "请输入数字选择: " num
 case "$num" in
     1) install_reality ;;
     2) show_config ;;
