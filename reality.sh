@@ -9,14 +9,12 @@ plain='\033[0m'
 red='\033[0;31m'
 
 show_menu() {
-    echo -e "
-  ${green}Reality + Caddy (Let's Encrypt) 一键管理脚本${plain}
-  --- 自动申请证书 + 自建伪装站 ---
-  ${green}1.${plain} 安装 Reality 环境 (Caddy + Xray)
-  ${green}2.${plain} 查看客户端配置信息
-  ${green}3.${plain} ${red}一键卸载 Reality${plain}
-  ${green}0.${plain} 退出脚本
-"
+    echo -e "${green}Reality + Caddy 一键管理脚本${plain}"
+    echo "1) 安装 Reality 环境"
+    echo "2) 查看客户端配置"
+    echo "3) 一键卸载 Reality"
+    echo "0) 退出脚本"
+    read -p "请输入数字选择: " num
 }
 
 install_reality() {
@@ -155,10 +153,9 @@ uninstall_reality() {
     fi
 }
 
-# 脚本入口 - 已修复变量作用域问题
+# 脚本入口修改
 clear
-show_menu
-read -p "请输入数字选择: " num
+num=$(show_menu)  # 获取返回值
 case "$num" in
     1) install_reality ;;
     2) show_config ;;
