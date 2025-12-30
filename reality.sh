@@ -4,9 +4,9 @@
 [[ $EUID -ne 0 ]] && echo "请以root用户运行此脚本" && exit 1
 
 # 颜色定义
-green='\033[0;32m'
-plain='\033[0m'
-red='\033[0;31m'
+green='[0;32m'
+plain='[0m'
+red='[0;31m'
 
 show_menu() {
     echo -e "
@@ -35,7 +35,7 @@ install_reality() {
     # 4. 获取用户输入
     read -p "请输入你的解析域名 (例如 myweb.com): " MY_DOMAIN
     read -p "请输入你的邮箱 (用于 Let's Encrypt): " MY_EMAIL
-    
+
     V_UUID=$(uuidgen)
     PRIV_KEY=$(xray x25519 | grep "Private key" | awk '{print $3}')
     PUB_KEY=$(xray x25519 -i "$PRIV_KEY" | grep "Public key" | awk '{print $3}')
