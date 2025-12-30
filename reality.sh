@@ -34,10 +34,9 @@ install_reality() {
 
     # 4. 获取用户输入
     read -p "请输入你的解析域名 (例如 myweb.com): " MY_DOMAIN
-    read -p "请输入你的邮箱 (用于 Let's Encrypt 证书申请): " MY_EMAIL
+    read -p "请输入你的邮箱 (用于 Let's Encrypt): " MY_EMAIL
     
     V_UUID=$(uuidgen)
-    # 获取密钥对
     PRIV_KEY=$(xray x25519 | grep "Private key" | awk '{print $3}')
     PUB_KEY=$(xray x25519 -i "$PRIV_KEY" | grep "Public key" | awk '{print $3}')
     SHORT_ID=$(openssl rand -hex 8)
@@ -46,14 +45,18 @@ install_reality() {
     mkdir -p /var/www/html
     curl -L https://github.com/cloud-annotations/docusaurus-template/archive/refs/heads/main.tar.gz | tar -xz -C /var/www/html --strip-components=1
 
-    # 编写 Caddyfile，强制使用 Let's Encrypt
     cat <<EOF > /etc/caddy/Caddyfile
 {
     email $MY_EMAIL
-    cert_issuer acme
 }
 
 $MY_DOMAIN {
+    # 强制使用 Let's Encrypt
+    tls {
+        issuer acme {
+            dir https://acme-v02.api.letsencrypt.org/directory
+        }
+    }
     reverse_proxy 127.0.0.1:8080
 }
 
@@ -91,7 +94,7 @@ EOF
 }
 EOF
 
-    # 7. 保存信息
+    # 7. 保存记录
     cat <<EOF > /etc/reality_info.conf
 DOMAIN=$MY_DOMAIN
 UUID=$V_UUID
@@ -101,7 +104,7 @@ EOF
 
     systemctl restart xray
     systemctl enable xray
-    echo -e "${green}安装完成！Caddy 正在通过 Let's Encrypt 申请证书，请确保 80 端口未被占用且域名解析已生效。${plain}"
+    echo -e "${green}安装完成！${plain}"
     show_config
 }
 
@@ -114,16 +117,7 @@ show_config() {
     SERVER_IP=$(curl -s ipv4.icanhazip.com)
 
     echo -e "
-${green}========== 客户端配置信息 ==========${plain}
-地址: ${SERVER_IP}
-端口: 443
-UUID: ${UUID}
-流控: xtls-rprx-vision
-SNI: ${DOMAIN}
-PublicKey: ${PUBKEY}
-ShortId: ${SID}
-
-${green}========== 客户端 JSON (直接复制) ==========${plain}
+${green}========== 客户端 JSON 配置 ==========${plain}
 "
     cat <<EOF
 {
@@ -152,34 +146,23 @@ EOF
 }
 
 uninstall_reality() {
-    read -p "确定要彻底卸载吗？(y/n): " confirm
+    read -p "确认卸载？(y/n): " confirm
     if [[ "$confirm" == "y" ]]; then
         systemctl stop xray caddy
-        systemctl disable xray caddy
         bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove
         apt purge -y caddy
         rm -rf /usr/local/etc/xray /etc/caddy /var/www/html /etc/reality_info.conf
-        echo -e "${green}已成功卸载所有组件。${plain}"
+        echo -e "${green}卸载成功。${plain}"
     fi
 }
 
-# 脚本入口逻辑
+# 脚本入口
 clear
 show_menu
 case "$num" in
-    1)
-        install_reality
-        ;;
-    2)
-        show_config
-        ;;
-    3)
-        uninstall_reality
-        ;;
-    0)
-        exit 0
-        ;;
-    *)
-        echo -e "${red}请输入正确数字${plain}"
-        ;;
+    1) install_reality ;;
+    2) show_config ;;
+    3) uninstall_reality ;;
+    0) exit 0 ;;
+    *) echo -e "${red}无效输入${plain}" ;;
 esac
