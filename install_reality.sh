@@ -1,27 +1,66 @@
 #!/bin/bash
 
-# 1. 环境准备
-apt update && apt install -y curl nginx uuid-runtime openssl
+# 检查是否为root用户
+[[ $EUID -ne 0 ]] && echo "请以root用户运行此脚本" && exit 1
 
-# 2. 获取用户输入
-read -p "请输入你的域名 (例如 myweb.com): " MY_DOMAIN
-V_UUID=$(uuidgen)
-KEYS=$(/usr/local/bin/xray x25519) # 假设已安装xray，若无则先装
-# 简易安装 Xray
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+# 颜色定义
+green='\033[0;32m'
+plain='\033[0m'
+red='\033[0;31m'
 
-# 3. 生成密钥
-PRIV_KEY=$(xray x25519 | grep "Private key" | awk '{print $3}')
-PUB_KEY=$(xray x25519 -i "$PRIV_KEY" | grep "Public key" | awk '{print $3}')
-SHORT_ID=$(openssl rand -hex 8)
+show_menu() {
+    echo -e "
+  ${green}Reality + Caddy 一键管理脚本${plain}
+  --- 自动申请证书 + 自建伪装站 ---
+  ${green}1.${plain} 安装 Reality 环境 (Caddy + Xray)
+  ${green}2.${plain} 查看客户端配置信息
+  ${green}3.${plain} ${red}一键卸载 Reality${plain}
+  ${green}0.${plain} 退出脚本
+"
+    read -p "请输入数字选择: " num
+}
 
-# 4. 配置伪装网页
-rm -rf /var/www/html/*
-curl -L https://github.com/cloud-annotations/docusaurus-template/archive/refs/heads/main.tar.gz | tar -xz -C /var/www/html --strip-components=1
-systemctl restart nginx
+install_reality() {
+    # 1. 环境准备
+    apt update && apt install -y curl debian-keyring debian-archive-keyring apt-transport-https uuid-runtime openssl tar
 
-# 5. 配置 Xray
-cat <<EOF > /usr/local/etc/xray/config.json
+    # 2. 安装 Caddy
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+    apt update && apt install caddy -y
+
+    # 3. 安装 Xray-core
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+    # 4. 获取用户输入
+    read -p "请输入你的解析域名 (例如 myweb.com): " MY_DOMAIN
+    read -p "请输入你的邮箱 (用于自动申请SSL证书): " MY_EMAIL
+    
+    V_UUID=$(uuidgen)
+    PRIV_KEY=$(xray x25519 | grep "Private key" | awk '{print $3}')
+    PUB_KEY=$(xray x25519 -i "$PRIV_KEY" | grep "Public key" | awk '{print $3}')
+    SHORT_ID=$(openssl rand -hex 8)
+
+    # 5. 配置 Caddy 伪装网站 (监听 8080，避免与 Xray 冲突)
+    # 下载一个美观的静态 HTML 模板
+    mkdir -p /var/www/html
+    curl -L https://github.com/cloud-annotations/docusaurus-template/archive/refs/heads/main.tar.gz | tar -xz -C /var/www/html --strip-components=1
+
+    cat <<EOF > /etc/caddy/Caddyfile
+$MY_DOMAIN {
+    reverse_proxy 127.0.0.1:8080
+}
+
+http://$MY_DOMAIN:8080 {
+    root * /var/www/html
+    file_server
+}
+EOF
+    systemctl restart caddy
+
+    # 6. 配置 Xray
+    # 注意：Reality 监听 443，遇到非代理流量转发给 Caddy 的 8080 端口
+    cat <<EOF > /usr/local/etc/xray/config.json
 {
     "inbounds": [{
         "port": 443,
@@ -35,7 +74,7 @@ cat <<EOF > /usr/local/etc/xray/config.json
             "security": "reality",
             "realitySettings": {
                 "show": false,
-                "dest": "127.0.0.1:80",
+                "dest": "127.0.0.1:8080",
                 "xver": 0,
                 "serverNames": ["$MY_DOMAIN"],
                 "privateKey": "$PRIV_KEY",
@@ -47,18 +86,86 @@ cat <<EOF > /usr/local/etc/xray/config.json
 }
 EOF
 
-# 6. 启动服务
-systemctl restart xray
-systemctl enable xray
+    # 7. 保存信息
+    cat <<EOF > /etc/reality_info.conf
+DOMAIN=$MY_DOMAIN
+UUID=$V_UUID
+PUBKEY=$PUB_KEY
+SID=$SHORT_ID
+EOF
 
-# 7. 输出配置信息
-echo "--------------------------------"
-echo "Reality 部署完成！"
-echo "域名: $MY_DOMAIN"
-echo "UUID: $V_UUID"
-echo "公钥 (PublicKey): $PUB_KEY"
-echo "Short ID: $SHORT_ID"
-echo "端口: 443"
-echo "SNI: $MY_DOMAIN"
-echo "流控: xtls-rprx-vision"
-echo "--------------------------------"
+    systemctl restart xray
+    systemctl enable xray
+    echo -e "${green}安装完成！Caddy 正在为你自动申请 SSL 证书，请稍候...${plain}"
+    show_config
+}
+
+show_config() {
+    if [[ ! -f /etc/reality_info.conf ]]; then
+        echo -e "${red}未检测到安装记录。${plain}"
+        return
+    fi
+    source /etc/reality_info.conf
+    SERVER_IP=$(curl -s ipv4.icanhazip.com)
+
+    echo -e "
+${green}========== 客户端配置信息 ==========${plain}
+地址: ${SERVER_IP}
+端口: 443
+UUID: ${UUID}
+流控: xtls-rprx-vision
+SNI: ${DOMAIN}
+PublicKey: ${PUBKEY}
+ShortId: ${SID}
+传输/安全: TCP + Reality
+
+${green}========== 客户端 JSON (直接复制) ==========${plain}
+"
+    cat <<EOF
+{
+  "outbounds": [{
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{
+        "address": "$SERVER_IP",
+        "port": 443,
+        "users": [{ "id": "$UUID", "encryption": "none", "flow": "xtls-rprx-vision" }]
+      }]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "publicKey": "$PUBKEY",
+        "fingerprint": "chrome",
+        "serverName": "$DOMAIN",
+        "shortId": "$SID"
+      }
+    }
+  }]
+}
+EOF
+}
+
+uninstall_reality() {
+    read -p "确定要彻底卸载 Caddy 和 Xray 吗？(y/n): " confirm
+    if [[ "$confirm" == "y" ]]; then
+        systemctl stop xray caddy
+        systemctl disable xray caddy
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove
+        apt purge -y caddy
+        rm -rf /usr/local/etc/xray /etc/caddy /var/www/html /etc/reality_info.conf
+        echo -e "${green}已成功卸载所有组件。${plain}"
+    fi
+}
+
+# 脚本入口
+clear
+show_menu
+case $num in
+    1) install_reality ;;
+    2) show_config ;;
+    3) uninstall_reality ;;
+    0) exit 0 ;;
+    *) echo -e "${red}请输入正确数字${plain}" ;;
+esac
