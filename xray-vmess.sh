@@ -328,9 +328,9 @@ EOF
     print_success "Caddy配置文件生成完成"
 }
 
-# 生成伪装网站模板
+# 生成个人网站模板
 generate_website_template() {
-    print_info "正在生成伪装网站..."
+    print_info "正在生成网站..."
     
     mkdir -p ${WEB_DIR}
     
@@ -392,7 +392,7 @@ generate_website_template() {
 </html>
 EOF
     
-    print_success "伪装网站生成完成"
+    print_success "网站生成完成"
 }
 
 # 保存配置信息
@@ -802,7 +802,7 @@ show_config() {
     echo -e "${CYAN}【配置文件位置】${NC}"
     echo "  Xray配置: ${XRAY_CONFIG}"
     echo "  Caddy配置: ${CADDY_CONFIG}"
-    echo "  伪装网站: ${WEB_DIR}/index.html"
+    echo "  个人网站: ${WEB_DIR}/index.html"
     echo ""
     
     print_separator
