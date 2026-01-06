@@ -330,16 +330,41 @@ generate_singbox_config() {
       "tag": "block"
     }
   ]'
-        # 添加路由配置
+        # 添加路由配置（禁回国流量规则）
         route_config=',
   "route": {
     "rules": [
+      {
+        "protocol": ["bittorrent"],
+        "outbound": "block"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "224.0.0.0/4",
+          "240.0.0.0/4"
+        ],
+        "outbound": "block"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "block"
+      },
+      {
+        "domain_suffix": [".cn", ".中国"],
+        "outbound": "block"
+      },
       {
         "inbound": ["vless-in"],
         "outbound": "proxy"
       }
     ],
-    "final": "proxy"
+    "final": "proxy",
+    "auto_detect_interface": true
   }'
     else
         print_info "使用直连 (direct) 出站"
@@ -353,15 +378,45 @@ generate_singbox_config() {
       "tag": "block"
     }
   ]'
-        # 直连模式不需要路由配置
-        route_config=''
+        # 直连模式也添加禁回国规则
+        route_config=',
+  "route": {
+    "rules": [
+      {
+        "protocol": ["bittorrent"],
+        "outbound": "block"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "224.0.0.0/4",
+          "240.0.0.0/4"
+        ],
+        "outbound": "block"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "block"
+      },
+      {
+        "domain_suffix": [".cn", ".中国"],
+        "outbound": "block"
+      }
+    ],
+    "final": "direct",
+    "auto_detect_interface": true
+  }'
     fi
     
     cat > ${SINGBOX_CONFIG} <<EOF
 {
   "log": {
-    "level": "info",
-    "timestamp": true,
+    "level": "warn",
+    "timestamp": false,
     "output": "/var/log/singbox/singbox.log"
   },
   "inbounds": [
@@ -442,14 +497,9 @@ ${domain} {
     reverse_proxy @websocket localhost:${SINGBOX_PORT}
     
     # 其他所有请求 - 显示伪装网站
+    # 根目录 - 显示伪装网站
     root * ${WEB_DIR}
     file_server
-    
-    # 日志
-    log {
-        output file /var/log/caddy/access.log
-        format json
-    }
 }
 EOF
         print_success "配置已追加到${CADDY_CONFIG}"
@@ -476,14 +526,9 @@ ${domain} {
     reverse_proxy @websocket localhost:${SINGBOX_PORT}
     
     # 其他所有请求 - 显示伪装网站
+    # 根目录 - 显示伪装网站
     root * ${WEB_DIR}
     file_server
-    
-    # 日志
-    log {
-        output file /var/log/caddy/access.log
-        format json
-    }
 }
 EOF
         print_success "Caddy独立配置文件生成完成: ${CADDY_CONFIG}"
