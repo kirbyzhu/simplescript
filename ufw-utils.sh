@@ -48,6 +48,8 @@ check_ufw() {
 detect_ssh_port() {
     # 默认端口
     local port=22
+    local found_explicit=0
+    
     if [ -f "$SSH_CONFIG" ]; then
         # 查找未被注释的 Port 行
         # grep 匹配行首的 Port, awk 取第二个值
@@ -55,6 +57,12 @@ detect_ssh_port() {
         detected_port=$(grep -E "^Port [0-9]+" "$SSH_CONFIG" | head -n 1 | awk '{print $2}')
         if [[ -n "$detected_port" ]]; then
             port=$detected_port
+            found_explicit=1
+        fi
+        
+        # 增强检测: 如果未显式检测到端口且存在 Include 指令，提示风险
+        if [[ "$found_explicit" -eq 0 ]] && grep -q "^Include" "$SSH_CONFIG"; then
+            echo -e "${YELLOW}警告: 检测到 SSH 配置包含 Include 指令，且主文件中未显式指定端口。脚本可能无法准确获取端口 (回退默认 22)。${PLAIN}" >&2
         fi
     fi
     echo "$port"
@@ -400,6 +408,12 @@ fail2ban_install() {
             # 检查服务状态，如果正常则直接返回，避免重复配置和重启
             if systemctl is-active --quiet fail2ban; then
                  echo -e "${GREEN}Fail2ban 服务正在运行。跳过配置与重启。${PLAIN}"
+                 
+                 # 检查 UFW 是否启用
+                 if ! ufw status | grep -q "Status: active"; then
+                     echo -e "${RED}注意: UFW 未启用！Fail2ban 无法执行封禁动作。${PLAIN}"
+                 fi
+                 
                  read -p "按回车键继续..."
                  return
             fi
@@ -540,6 +554,12 @@ EOF
             echo -e "${RED}未进行修复。请手动检查: systemctl status fail2ban${PLAIN}"
         fi
     fi
+    
+    # 检查 UFW 是否启用 (Fail2ban 依赖 UFW)
+    if ! ufw status | grep -q "Status: active"; then
+        echo -e "${RED}注意: UFW 未启用！Fail2ban 无法执行封禁动作。请务必启用防火墙。${PLAIN}"
+    fi
+
     read -p "按回车键继续..."
 }
 
