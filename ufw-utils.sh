@@ -394,7 +394,7 @@ fail2ban_install() {
         if [[ "$reinstall" == "y" || "$reinstall" == "Y" ]]; then
             echo -e "${YELLOW}>>> 正在更新/重装 Fail2ban...${PLAIN}"
             apt-get update
-            apt-get install -y fail2ban
+            apt-get install -y fail2ban python3-systemd
         else
             echo -e "跳过安装步骤..."
             # 检查服务状态，如果正常则直接返回，避免重复配置和重启
@@ -408,7 +408,7 @@ fail2ban_install() {
     else
         echo -e "${YELLOW}>>> 正在安装 Fail2ban...${PLAIN}"
         apt-get update
-        apt-get install -y fail2ban
+        apt-get install -y fail2ban python3-systemd
         
         if ! command -v fail2ban-client &> /dev/null; then
             echo -e "${RED}Fail2ban 安装失败！${PLAIN}"
@@ -430,14 +430,16 @@ fail2ban_install() {
         echo -e "${GREEN}创建默认 jail.local...${PLAIN}"
         cat > "$FAIL2BAN_JAIL" <<EOF
 [DEFAULT]
-# 使用 UFW 进行封禁
+# Ban action (use UFW)
 banaction = ufw
 
 [sshd]
 enabled = true
-# 自动检测 backend (没有 auth.log 时使用 systemd)
+# Auto detect backend (use systemd if auth.log missing)
 backend = ${backend_mode}
 EOF
+        # 确保移除潜在的 Windows 回车符
+        sed -i 's/\r//' "$FAIL2BAN_JAIL"
     else
         echo -e "${YELLOW}检测到已有 jail.local，正在通过 sed 更新基础配置...${PLAIN}"
         # 1. 设置 banaction = ufw
@@ -499,22 +501,40 @@ EOF
             # 写入最小化配置
             cat > "$FAIL2BAN_JAIL" <<EOF
 [DEFAULT]
-# 使用 UFW 进行封禁
+# Ban action (use UFW)
 banaction = ufw
 
 [sshd]
 enabled = true
-# 自动检测 backend (没有 auth.log 时使用 systemd)
+# Auto detect backend (use systemd if auth.log missing)
 backend = ${backend_mode}
 EOF
+            # 确保移除潜在的 Windows 回车符
+            sed -i 's/\r//' "$FAIL2BAN_JAIL"
+            
             echo -e "${YELLOW}再次尝试启动...${PLAIN}"
             systemctl restart fail2ban
             
             if systemctl is-active --quiet fail2ban; then
                  echo -e "${GREEN}Fail2ban 修复并启动成功！${PLAIN}"
             else
-                 echo -e "${RED}仍然启动失败。尝试查看日志:${PLAIN}"
-                 echo -e "命令: journalctl -u fail2ban --no-pager -n 20"
+                 echo -e "${RED}启动仍然失败。尝试清理 Fail2ban 数据库并重试...${PLAIN}"
+                 systemctl stop fail2ban
+                 rm -f /var/lib/fail2ban/fail2ban.sqlite3
+                 systemctl restart fail2ban
+                 
+                 if systemctl is-active --quiet fail2ban; then
+                     echo -e "${GREEN}清理数据库后启动成功！${PLAIN}"
+                 else
+                     echo -e "${RED}最终启动失败。错误日志如下:${PLAIN}"
+                     echo -e "--- /var/log/fail2ban.log (Last 20 lines) ---"
+                     if [ -f /var/log/fail2ban.log ]; then
+                         tail -n 20 /var/log/fail2ban.log
+                     else
+                         echo "日志文件不存在。"
+                     fi
+                     echo -e "-----------------------------------------------"
+                 fi
             fi
         else
             echo -e "${RED}未进行修复。请手动检查: systemctl status fail2ban${PLAIN}"
