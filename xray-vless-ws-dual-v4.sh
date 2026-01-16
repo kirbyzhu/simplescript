@@ -361,7 +361,7 @@ func_generate_xray_config() {
     # 生成 Block CN 规则
     local block_rules=""
     if [ "$block_cn" == "true" ]; then
-        block_rules="{ \"type\": \"field\", \"outboundTag\": \"block\", \"domain\": [\"geosite:cn\"] }, { \"type\": \"field\", \"outboundTag\": \"block\", \"ip\": [\"geoip:cn\"] },"
+        block_rules="{ \"type\": \"field\", \"outboundTag\": \"direct\", \"domain\": [\"geosite:google\", \"geosite:google-cn\"] }, { \"type\": \"field\", \"outboundTag\": \"block\", \"domain\": [\"geosite:cn\"] }, { \"type\": \"field\", \"outboundTag\": \"block\", \"ip\": [\"geoip:cn\"] },"
     fi
     
     mkdir -p /usr/local/etc/xray
@@ -738,17 +738,48 @@ func_show_links() {
     local uuid=$(jq -r '.uuid' "$USER_CONFIG")
     local direct_path=$(jq -r '.ws_direct_path' "$USER_CONFIG")
     
-    echo -e "${CYAN}=== 配置链接 ===${NC}"
-    echo -e "${GREEN}[直连节点]${NC}"
-    echo "vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${direct_path}&sni=${domain}#${domain}-Direct"
+    echo -e "${CYAN}=== 客户端配置信息 ===${NC}"
+    echo -e "地址 (Address): ${GREEN}${domain}${NC}"
+    echo -e "端口 (Port): ${GREEN}443${NC}"
+    echo -e "用户 ID (UUID): ${GREEN}${uuid}${NC}"
+    echo -e "传输协议 (Network): ${GREEN}ws${NC}"
+    echo -e "伪装类型 (Type): ${GREEN}none${NC}"
+    echo -e "传输安全 (TLS): ${GREEN}tls${NC}"
+    echo -e "跳过证书验证 (AllowInsecure): ${GREEN}false${NC}"
+    echo "------------------------------------------------------"
     
+    echo -e "${CYAN}=== 节点详情与链接 ===${NC}"
+    
+    # Direct Node
+    echo -e "${GREEN}[节点 1: 直连节点]${NC}"
+    echo -e "路径 (Path): ${YELLOW}${direct_path}${NC}"
+    echo "链接:"
+    echo "vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${direct_path}&sni=${domain}#${domain}-Direct"
+    echo "------------------------------------------------------"
+    
+    # Transit Nodes
     local count=$(jq '.transit_nodes | length' "$USER_CONFIG")
     if [ "$count" -gt 0 ]; then
-        echo -e "\n${YELLOW}[中转节点]${NC}"
         for ((i=0; i<count; i++)); do
             local path=$(jq -r ".transit_nodes[$i].path" "$USER_CONFIG")
             local port=$(jq -r ".transit_nodes[$i].ss.port" "$USER_CONFIG")
+            # Extract SS details
+            local ss_server=$(jq -r ".transit_nodes[$i].ss.server" "$USER_CONFIG")
+            local ss_port=$(jq -r ".transit_nodes[$i].ss.port" "$USER_CONFIG")
+            local ss_method=$(jq -r ".transit_nodes[$i].ss.method" "$USER_CONFIG")
+            local ss_pass=$(jq -r ".transit_nodes[$i].ss.password" "$USER_CONFIG")
+            
+            local node_idx=$((i+2))
+            
+            echo -e "${YELLOW}[节点 ${node_idx}: 中转节点 (落地端口: $port)]${NC}"
+            echo -e "本机路径 (Path): ${YELLOW}${path}${NC}"
+            echo -e "落地 IP (Target IP): ${CYAN}${ss_server}${NC}"
+            echo -e "落地端口 (Target Port): ${CYAN}${ss_port}${NC}"
+            echo -e "加密方式 (Method): ${CYAN}${ss_method}${NC}"
+            echo -e "密码 (Password): ${CYAN}${ss_pass}${NC}"
+            echo "链接:"
             echo "vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${path}&sni=${domain}#${domain}-Transit-${port}"
+            echo "------------------------------------------------------"
         done
     fi
     echo ""
