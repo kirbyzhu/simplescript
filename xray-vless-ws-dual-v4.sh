@@ -143,6 +143,25 @@ func_install_core() {
     # 安装 Caddy
     if ! command -v caddy >/dev/null; then
         echo -e "${BLUE}[INFO]${NC} 正在安装 Caddy..."
+        
+        # 检查并安装 gnupg (gpg 命令依赖)
+        if ! command -v gpg >/dev/null 2>&1; then
+            echo -e "${YELLOW}[WARN]${NC} 检测到缺少 gpg 命令，正在安装 gnupg..."
+            if apt-get install -y gnupg 2>/dev/null; then
+                echo -e "${GREEN}[OK]${NC} gnupg 安装成功"
+            else
+                echo -e "${RED}[ERROR]${NC} gnupg 安装失败，尝试使用替代方案..."
+                # 如果 gnupg 安装失败，尝试安装 gnupg2
+                apt-get install -y gnupg2 2>/dev/null || {
+                    echo -e "${RED}[ERROR]${NC} 无法安装 gnupg，Caddy 安装可能失败"
+                    echo -e "${YELLOW}提示: 请手动执行 'apt-get install -y gnupg' 后重试${NC}"
+                    read -n 1 -s -p "按任意键继续..."
+                    return 1
+                }
+            fi
+        fi
+        
+        # 添加 Caddy 仓库并安装
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
         apt-get update && apt-get install -y caddy
