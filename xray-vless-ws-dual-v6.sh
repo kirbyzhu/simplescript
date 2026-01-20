@@ -199,6 +199,43 @@ func_install_core() {
     else
         echo -e "${GREEN}[INFO]${NC} Caddy 已安装"
     fi
+
+    # 确保 Caddy 用户存在
+    if ! id -u caddy >/dev/null 2>&1; then
+        echo -e "${BLUE}[INFO]${NC} 创建 Caddy 用户..."
+        useradd --system --home /var/lib/caddy --shell /usr/sbin/nologin caddy
+        mkdir -p /var/lib/caddy
+        chown caddy:caddy /var/lib/caddy
+    fi
+
+    # 创建 Caddy Service 文件 (如果是二进制安装或缺失)
+    if [ ! -f /etc/systemd/system/caddy.service ] && [ ! -f /lib/systemd/system/caddy.service ]; then
+        echo -e "${BLUE}[INFO]${NC} 创建 Caddy Service 文件..."
+        cat > /etc/systemd/system/caddy.service <<EOF
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+LimitNPROC=512
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        echo -e "${GREEN}[OK]${NC} Caddy Service 创建完成"
+    fi
     
     # 更新 GeoData
     echo -e "${BLUE}[INFO]${NC} 更新 GeoData..."
