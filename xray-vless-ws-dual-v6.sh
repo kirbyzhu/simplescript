@@ -79,40 +79,76 @@ generate_uuid() {
     fi
 }
 
-# 解析 SS 链接
+# 解析 SS 链接 (Enhanced v2)
 parse_ss_link() {
-    local ss_link=$1
-    ss_link=$(echo "$ss_link" | sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r\n' | tr -d '[:cntrl:]')
-    ss_link=${ss_link#ss://}
-    local main_part=${ss_link%%#*}
+    local link="$1"
+    link=${link#ss://}
     
-    if [[ ! "$main_part" =~ @ ]]; then
-        echo "[ERROR] SS 链接格式错误：缺少 @" >&2
-        return 1
+    local server port method password
+    
+    # --- Strategy A: Standard SIP002 (userinfo@host:port) ---
+    if [[ "$link" =~ @ ]]; then
+        local userinfo hostport
+        userinfo=$(echo "$link" | awk -F'@' '{print $1}')
+        hostport=$(echo "$link" | awk -F'@' '{print $2}')
+        
+        # Decode userinfo
+        local mod=$((${#userinfo} % 4))
+        if [ $mod -eq 2 ]; then userinfo="${userinfo}=="; elif [ $mod -eq 3 ]; then userinfo="${userinfo}="; fi
+        local decoded
+        decoded=$(echo "$userinfo" | base64 -d 2>/dev/null)
+        
+        if [ -n "$decoded" ] && [[ "$hostport" =~ : ]]; then
+             server=$(echo "$hostport" | cut -d':' -f1)
+             port=$(echo "$hostport" | cut -d':' -f2 | grep -oE '^[0-9]+')
+             
+             if [ -n "$server" ] && [ -n "$port" ]; then
+                 method=$(echo "$decoded" | cut -d':' -f1)
+                 password=$(echo "$decoded" | cut -d':' -f2-)
+                 echo "$server|$port|$method|$password"
+                 return 0
+             fi
+        fi
     fi
     
-    local auth_part=${main_part%%@*}
-    local server_part=${main_part##*@}
-    
-    if [[ ! "$server_part" =~ : ]]; then
-        echo "[ERROR] SS 链接格式错误：服务器地址格式无效" >&2
-        return 1
+    # --- Strategy B: Legacy Base64(method:password@host:port) ---
+    local decoded_full
+    decoded_full=$(echo "$link" | base64 -d 2>/dev/null)
+    if [[ "$decoded_full" =~ :.*@.*: ]]; then
+         local info=$(echo "$decoded_full" | cut -d'@' -f1)
+         local hp=$(echo "$decoded_full" | cut -d'@' -f2)
+         method=$(echo "$info" | cut -d':' -f1)
+         password=$(echo "$info" | cut -d':' -f2-)
+         server=$(echo "$hp" | cut -d':' -f1)
+         port=$(echo "$hp" | cut -d':' -f2)
+         echo "$server|$port|$method|$password"
+         return 0
     fi
     
-    local server=${server_part%:*}
-    local port=${server_part##*:}
-    local decoded=$(echo "$auth_part" | base64 -d 2>/dev/null)
+    # --- Strategy C: Heuristic for "Messy" Links (Terminal Copy) ---
+    local found_ip_port
+    found_ip_port=$(echo "$link" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}' | tail -n 1)
     
-    if [ -z "$decoded" ] || [[ ! "$decoded" =~ : ]]; then
-        echo "[ERROR] Base64 解码失败/格式无效" >&2
-        return 1
+    if [ -n "$found_ip_port" ]; then
+         server=$(echo "$found_ip_port" | cut -d':' -f1)
+         port=$(echo "$found_ip_port" | cut -d':' -f2)
+         
+         local candidate_b64
+         candidate_b64=$(echo "$link" | grep -oE '^[A-Za-z0-9+/]+={0,2}' | head -n 1)
+         local decoded_info
+         decoded_info=$(echo "$candidate_b64" | base64 -d 2>/dev/null)
+         
+         if [[ "$decoded_info" =~ : ]]; then
+             method=$(echo "$decoded_info" | cut -d':' -f1)
+             password=$(echo "$decoded_info" | cut -d':' -f2-)
+             if [[ "$method" =~ (aes|chacha|2022|gcm) ]]; then
+                 echo "$server|$port|$method|$password"
+                 return 0
+             fi
+         fi
     fi
     
-    local method=${decoded%%:*}
-    local password=${decoded##*:}
-    
-    echo "$server|$port|$method|$password"
-    return 0
+    return 1
 }
 
 # 验证核心依赖是否就绪
