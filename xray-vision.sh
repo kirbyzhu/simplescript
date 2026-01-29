@@ -410,9 +410,8 @@ func_generate_xray_config() {
     # 构建 Clients 列表
     local clients="{\"id\": \"$uuid_main\", \"flow\": \"xtls-rprx-vision\", \"email\": \"main\"}"
     
-    # 构建 Outbounds 和 Routing Rules (使用数组避免逗号问题)
+    # 构建 Outbounds
     local transit_outbounds=""
-    local routing_rules_arr=()
     
     local count
     count=$(jq '.transit_nodes | length' "$USER_CONFIG")
@@ -435,16 +434,49 @@ func_generate_xray_config() {
                     \"servers\": [{ \"address\": \"$ss_server\", \"port\": $ss_port, \"method\": \"$ss_method\", \"password\": \"$ss_pass\" }]
                 }
             }"
-            
-            routing_rules_arr+=("{ \"type\": \"field\", \"user\": [\"$t_email\"], \"outboundTag\": \"out-$t_tag\" }")
         done
     fi
     
-    # Block CN 规则
+    # ============================================================
+    # 路由规则构建 (按优先级顺序)
+    # 
+    # 【问题】geosite:cn 可能包含 google.cn 等域名，会导致中转用户访问
+    #        谷歌中国时被误杀。需要在 Block CN 之前放行 Google 域名。
+    # 
+    # 【规则顺序】
+    # 1. main 用户 Google → direct
+    # 2. 中转用户 Google → 对应落地 SS (防止被 Block CN 误杀)
+    # 3. Block CN (全局)
+    # 4. 中转用户兜底 → 对应落地 SS
+    # 5. 默认 → direct
+    # ============================================================
+    local routing_rules_arr=()
+    
     if [ "$block_cn" == "true" ]; then
-        routing_rules_arr+=("{ \"type\": \"field\", \"outboundTag\": \"direct\", \"domain\": [\"geosite:google\", \"geosite:google-cn\"] }")
+        # --- 1. main 用户 Google 直连 ---
+        routing_rules_arr+=("{ \"type\": \"field\", \"outboundTag\": \"direct\", \"user\": [\"main\"], \"domain\": [\"geosite:google\", \"geosite:google-cn\"] }")
+        
+        # --- 2. 中转用户 Google 走落地 (防止 geosite:cn 误杀 google.cn) ---
+        if [ "$count" -gt 0 ]; then
+            for ((i=0; i<count; i++)); do
+                local t_email="user-transit-$i"
+                local t_tag="transit-$i"
+                routing_rules_arr+=("{ \"type\": \"field\", \"user\": [\"$t_email\"], \"outboundTag\": \"out-$t_tag\", \"domain\": [\"geosite:google\", \"geosite:google-cn\"] }")
+            done
+        fi
+        
+        # --- 3. Block CN (全局) ---
         routing_rules_arr+=("{ \"type\": \"field\", \"outboundTag\": \"block\", \"domain\": [\"geosite:cn\"] }")
         routing_rules_arr+=("{ \"type\": \"field\", \"outboundTag\": \"block\", \"ip\": [\"geoip:cn\"] }")
+    fi
+    
+    # --- 4. 中转用户兜底 (非 Google、非 CN 的其他流量) ---
+    if [ "$count" -gt 0 ]; then
+        for ((i=0; i<count; i++)); do
+            local t_email="user-transit-$i"
+            local t_tag="transit-$i"
+            routing_rules_arr+=("{ \"type\": \"field\", \"user\": [\"$t_email\"], \"outboundTag\": \"out-$t_tag\" }")
+        done
     fi
     
     # 拼接路由规则 (正确处理逗号)
