@@ -485,10 +485,30 @@ func_generate_xray_config() {
         done
     fi
     
-    # 生成 Block CN 规则
-    local block_rules=""
+    # ==============================================================================
+    # 路由规则生成逻辑 (v5.1 重构)
+    # 
+    # 【设计目标】
+    # - 直连模式 (in-direct)：Google 直连，CN 域名/IP 屏蔽
+    # - 中转模式 (in-transit-*)：所有流量走落地 SS，CN 域名/IP 屏蔽（不送往落地）
+    # 
+    # 【规则执行顺序】(Xray 按顺序匹配，首条命中即停止)
+    # 1. CN 屏蔽规则（全局生效，无论直连还是中转）
+    # 2. 直连入站的 Google 流量 → direct（仅对 in-direct 生效）
+    # 3. 直连入站的其他流量 → direct
+    # 4. 中转入站的流量 → 对应 SS outbound
+    # ==============================================================================
+    
+    local block_cn_rules=""
+    local google_direct_rule=""
+    
     if [ "$block_cn" == "true" ]; then
-        block_rules="{ \"type\": \"field\", \"outboundTag\": \"direct\", \"domain\": [\"geosite:google\", \"geosite:google-cn\"] }, { \"type\": \"field\", \"outboundTag\": \"block\", \"domain\": [\"geosite:cn\"] }, { \"type\": \"field\", \"outboundTag\": \"block\", \"ip\": [\"geoip:cn\"] },"
+        # Block CN 规则 (全局生效，优先级最高)
+        block_cn_rules="{ \"type\": \"field\", \"outboundTag\": \"block\", \"domain\": [\"geosite:cn\"] },
+      { \"type\": \"field\", \"outboundTag\": \"block\", \"ip\": [\"geoip:cn\"] },"
+        
+        # Google 直连规则 (仅对直连入站生效，避免 geosite:cn 误杀 google-cn 子域)
+        google_direct_rule="{ \"type\": \"field\", \"inboundTag\": [\"in-direct\"], \"outboundTag\": \"direct\", \"domain\": [\"geosite:google\", \"geosite:google-cn\"] },"
     fi
     
     mkdir -p /usr/local/etc/xray
@@ -532,7 +552,8 @@ func_generate_xray_config() {
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      $block_rules
+      $google_direct_rule
+      $block_cn_rules
       { "type": "field", "inboundTag": ["in-direct"], "outboundTag": "direct" }
       $routing_rules
     ]
