@@ -5,7 +5,7 @@
 # Author: Antigravity
 # Description: Pure VLESS-TCP-XTLS-Vision with Multi-User Routing
 # ====================================================
-# 更新日志 (v3.0 - 2026-01-21)
+# 更新日志 (v3.0 - 2026-01-29)
 # - [Default] Block CN 默认开启
 # - [Web] 高级伪装站点 (CSS/HTML5)
 # - [Cert] 支持 Let's Encrypt / ZeroSSL 切换与复用
