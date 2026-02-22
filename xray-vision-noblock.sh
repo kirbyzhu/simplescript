@@ -1,11 +1,15 @@
 #!/bin/bash
 
 # ====================================================
-# Xray Vision 一键部署脚本 v3.1 (No-Block 版)
+# Xray Vision 一键部署脚本 v3.2 (No-Block 版)
 # Author: Antigravity
 # Description: Pure VLESS-TCP-XTLS-Vision (移除所有国内流量拦截与路由限制)
 # ====================================================
 # 更新日志
+# v3.2 (2026-02-22)
+# - [Fix] 修复 set -euo pipefail 下因 pgrep, getent 和 jq 异常返回导致的脚本意外退出
+# - [Safe] 增加卸载操作时的二次交互确认，防止误删配置文件和数据
+# - [Opt] 修正菜单标题显示的脚本版本号
 # v3.1 (2026-02-16)
 # - [Security] 收紧 SSL 私钥文件权限 (644 -> 600)
 # - [Opt] 移除 acme.sh 强制申请参数 (--force) 以防限流
@@ -374,12 +378,12 @@ EOF
 func_generate_xray_config() {
     if [ ! -f "$USER_CONFIG" ]; then return; fi
     local uuid_main domain
-    uuid_main=$(jq -r '.uuid' "$USER_CONFIG")
-    domain=$(jq -r '.domain' "$USER_CONFIG")
+    uuid_main=$(jq -r '.uuid' "$USER_CONFIG" 2>/dev/null || echo "")
+    domain=$(jq -r '.domain' "$USER_CONFIG" 2>/dev/null || echo "")
     local clients="{\"id\": \"$uuid_main\", \"flow\": \"xtls-rprx-vision\", \"email\": \"main\"}"
     local transit_outbounds=""
     local count
-    count=$(jq '.transit_nodes | length' "$USER_CONFIG")
+    count=$(jq '.transit_nodes | length' "$USER_CONFIG" 2>/dev/null || echo 0)
     if [ "$count" -gt 0 ]; then
         for ((i=0; i<count; i++)); do
             local t_uuid t_tag t_email ss_server ss_port ss_method ss_pass
@@ -575,7 +579,7 @@ func_list_transits() {
         return
     fi
     local count
-    count=$(jq '.transit_nodes | length' "$USER_CONFIG")
+    count=$(jq '.transit_nodes | length' "$USER_CONFIG" 2>/dev/null || echo 0)
     if [ "$count" -eq 0 ]; then
         echo -e "${YELLOW}暂无中转节点${NC}"
         return
@@ -626,7 +630,7 @@ func_manage_transits() {
                         if ! func_is_valid_ip "$ss_ip"; then
                             echo -e "${YELLOW}检测到域名，正在解析: $ss_ip ...${NC}"
                             local resolved_ip
-                            resolved_ip=$(getent hosts "$ss_ip" | awk '{print $1}' | head -n 1)
+                            resolved_ip=$(getent hosts "$ss_ip" | awk '{print $1}' | head -n 1 || true)
                             if [ -n "$resolved_ip" ]; then
                                 echo -e "解析结果: ${GREEN}$resolved_ip${NC}"
                                 ss_ip="$resolved_ip"
@@ -648,7 +652,7 @@ func_manage_transits() {
                         else
                             echo -e "${YELLOW}正在解析域名: $input_addr ...${NC}"
                             local resolved_ip
-                            resolved_ip=$(getent hosts "$input_addr" | awk '{print $1}' | head -n 1)
+                            resolved_ip=$(getent hosts "$input_addr" | awk '{print $1}' | head -n 1 || true)
                             if [ -n "$resolved_ip" ]; then
                                 echo -e "解析成功: ${GREEN}$resolved_ip${NC}"
                                 read -p "确认使用此 IP? [Y/n]: " use_res
@@ -734,8 +738,8 @@ func_show_links() {
         return
     fi
     local domain uuid
-    domain=$(jq -r '.domain' "$USER_CONFIG")
-    uuid=$(jq -r '.uuid' "$USER_CONFIG")
+    domain=$(jq -r '.domain' "$USER_CONFIG" 2>/dev/null || echo "")
+    uuid=$(jq -r '.uuid' "$USER_CONFIG" 2>/dev/null || echo "")
     echo -e "${CYAN}=== 节点链接 (VLESS-Vision XTLS) ===${NC}"
     show_details() {
         echo -e "---------------------------------------------------"
@@ -755,7 +759,7 @@ func_show_links() {
     local main_link="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=tcp&flow=xtls-rprx-vision&headerType=none&sni=${domain}#${domain}-Main"
     show_details "${domain}-Main" "$domain" "$uuid" "$main_link"
     local count
-    count=$(jq '.transit_nodes | length' "$USER_CONFIG")
+    count=$(jq '.transit_nodes | length' "$USER_CONFIG" 2>/dev/null || echo 0)
     if [ "$count" -gt 0 ]; then
         for ((i=0; i<count; i++)); do
             local t_uuid note link ss_server ss_port ss_method ss_pass
@@ -783,23 +787,23 @@ func_show_status() {
     clear
     echo -e "${CYAN}=== 服务运行状态 ===${NC}"
     local x_pid
-    x_pid=$(pgrep -x xray | head -n 1)
+    x_pid=$(pgrep -x xray | head -n 1 || true)
     if [ -n "$x_pid" ]; then
         local x_ver x_uptime x_mem
-        x_ver=$(xray version | head -n 1 | awk '{print $2}')
-        x_uptime=$(ps -o etime= -p "$x_pid" | xargs)
-        x_mem=$(ps -o rss= -p "$x_pid" | awk '{print int($1/1024)}')
+        x_ver=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}' || true)
+        x_uptime=$(ps -o etime= -p "$x_pid" 2>/dev/null | xargs || true)
+        x_mem=$(ps -o rss= -p "$x_pid" 2>/dev/null | awk '{print int($1/1024)}' || echo 0)
         echo -e "Xray Core: ${GREEN}Running${NC} v$x_ver (PID: $x_pid, Mem: ${x_mem}MB, Up: $x_uptime)"
     else
         echo -e "Xray Core: ${RED}Stopped${NC}"
     fi
     local c_pid
-    c_pid=$(pgrep -x caddy | head -n 1)
+    c_pid=$(pgrep -x caddy | head -n 1 || true)
     if [ -n "$c_pid" ]; then
         local c_ver c_uptime c_mem
-        c_ver=$(caddy version | awk '{print $1}')
-        c_uptime=$(ps -o etime= -p "$c_pid" | xargs)
-        c_mem=$(ps -o rss= -p "$c_pid" | awk '{print int($1/1024)}')
+        c_ver=$(caddy version 2>/dev/null | awk '{print $1}' || true)
+        c_uptime=$(ps -o etime= -p "$c_pid" 2>/dev/null | xargs || true)
+        c_mem=$(ps -o rss= -p "$c_pid" 2>/dev/null | awk '{print int($1/1024)}' || echo 0)
         echo -e "Caddy Web: ${GREEN}Running${NC} $c_ver (PID: $c_pid, Mem: ${c_mem}MB, Up: $c_uptime)"
     else
         echo -e "Caddy Web: ${RED}Stopped${NC}"
@@ -822,18 +826,34 @@ func_uninstall() {
     read -p "选择: " ch
     case "$ch" in
         1)
-            rm -rf "$CONFIG_DIR" "$LOG_DIR" /usr/local/etc/xray/config.json /etc/caddy/Caddyfile
-            systemctl restart xray caddy 2>/dev/null
-            echo "配置已清除"
+            read -p "确定要清除所有配置文件和日志吗？[y/N]: " conf_del
+            if [[ "$conf_del" == "y" || "$conf_del" == "Y" ]]; then
+                rm -rf "$CONFIG_DIR" "$LOG_DIR" /usr/local/etc/xray/config.json /etc/caddy/Caddyfile
+                systemctl restart xray caddy 2>/dev/null || true
+                echo "配置已清除"
+            else
+                echo "已取消操作"
+            fi
             func_pause
             ;;
         2)
-            rm -rf /var/www/vision-site
-            echo "网站文件已清除"
+            read -p "确定要删除伪装网站吗？[y/N]: " site_del
+            if [[ "$site_del" == "y" || "$site_del" == "Y" ]]; then
+                rm -rf /var/www/vision-site
+                echo "网站文件已清除"
+            else
+                echo "已取消操作"
+            fi
             func_pause
             ;;
         3)
             echo -e "${YELLOW}警告: 此操作将删除所有相关文件与服务${NC}"
+            read -p "您确定要彻底卸载吗？此操作不可逆！[y/N]: " full_del
+            if [[ "$full_del" != "y" && "$full_del" != "Y" ]]; then
+                echo "已取消卸载"
+                func_pause
+                return
+            fi
             echo "证书位置: /usr/local/etc/xray/certs/"
             read -p "是否保留 SSL 证书? [Y/n]: " keep_cert
             echo -e "${BLUE}[INFO]${NC} 停止服务..."
@@ -861,7 +881,7 @@ func_uninstall() {
 func_menu() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    Xray Vision Manager v3.0 (No-Block) ║${NC}"
+    echo -e "${CYAN}║    Xray Vision Manager v3.2 (No-Block) ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
     echo ""
     echo "  1. 安装/更新环境"
