@@ -1,11 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.4.3
+# ufw-utils.sh v1.4.4
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-07] v1.4.4 [Fix] 修复 UFW 状态误报: oneshot 服务下 systemctl is-active 始终
+#                           返回 inactive，改用 ufw status 自身输出判断真实运行状态
 # [2026-04-07] v1.4.3 [Fix] 完整修复 SSH 端口更换: 自动检测 systemd socket 激活模式，
 #                           创建 drop-in 来同步更新 socket 监听端口，修复远程监听旧端口问题
 # [2026-04-07] v1.4.2 [Fix] 修复 SSH 重启逻辑不可靠: 改为强制尝试两个服务名并用 ss 验证新端口监听
@@ -640,8 +642,14 @@ fail2ban_uninstall() {
 # 查看 UFW 详细状态与日志
 ufw_status_detailed() {
     echo -e "${SKYBLUE}>>> UFW 运行状态${PLAIN}"
-    # UFW 是内核模块，没有单一进程，但 systemctl status ufw 可看服务状态
-    get_service_info ufw
+    # 注意: UFW 的 systemd 服务是 oneshot 类型——加载完 iptables 规则后进程即退出
+    # 因此 systemctl is-active ufw 始终返回 inactive，不能用来判断 UFW 是否生效
+    # 正确做法：直接解析 ufw status 的输出
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "状态详情: ${GREEN}运行中 (防火墙规则已加载至内核)${PLAIN}"
+    else
+        echo -e "状态详情: ${RED}未启用${PLAIN}"
+    fi
     echo -e "----------------------------------------"
     ufw status verbose
     
@@ -857,7 +865,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.4.3"
+        echo -e "      UFW & Fail2ban 一键管理 v1.4.4"
         echo -e "========================================" 
         
         # 顶部状态栏
