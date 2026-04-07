@@ -1,11 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.4.4
+# ufw-utils.sh v1.4.5
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-07] v1.4.5 [Fix] 修复 socket drop-in 只监听 IPv6: ListenStream 只写端口号时
+#                           systemd 默认绑定 [::]，IPv4 客户端无法连接。改为显式双栈监听
 # [2026-04-07] v1.4.4 [Fix] 修复 UFW 状态误报: oneshot 服务下 systemctl is-active 始终
 #                           返回 inactive，改用 ufw status 自身输出判断真实运行状态
 # [2026-04-07] v1.4.3 [Fix] 完整修复 SSH 端口更换: 自动检测 systemd socket 激活模式，
@@ -793,11 +795,14 @@ change_ssh_port() {
         local dropin_dir="/etc/systemd/system/${socket_unit}.d"
         local dropin_file="${dropin_dir}/listen.conf"
         mkdir -p "$dropin_dir"
-        # ListenStream= 第一行置空是必须的，用于清除默认值再追加新值
+        # ListenStream= 第一行置空是必须的，用于清除默认值
+        # 必须分别指定 IPv4 (0.0.0.0) 和 IPv6 ([::]) 地址，否则只写端口号时
+        # systemd 默认只绑定 IPv6，导致 IPv4 客户端无法连接
         cat > "$dropin_file" << EOF
 [Socket]
 ListenStream=
-ListenStream=${new_port}
+ListenStream=0.0.0.0:${new_port}
+ListenStream=[::]:${new_port}
 EOF
         echo -e "${GREEN}已创建 socket drop-in: ${dropin_file}${PLAIN}"
 
@@ -865,7 +870,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.4.4"
+        echo -e "      UFW & Fail2ban 一键管理 v1.4.5"
         echo -e "========================================" 
         
         # 顶部状态栏
