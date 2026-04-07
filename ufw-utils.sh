@@ -1,11 +1,18 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.3.1
+# ufw-utils.sh v1.4.3
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-07] v1.4.3 [Fix] 完整修复 SSH 端口更换: 自动检测 systemd socket 激活模式，
+#                           创建 drop-in 来同步更新 socket 监听端口，修复远程监听旧端口问题
+# [2026-04-07] v1.4.2 [Fix] 修复 SSH 重启逻辑不可靠: 改为强制尝试两个服务名并用 ss 验证新端口监听
+# [2026-04-07] v1.4.1 [Fix] 全面审查修复: 菜单版本号、apt-get错误检测、date空值崩溃、
+#                           ((count++)) 零值退出、echo -e可移植性、sort_rules pipefail隐患
+# [2026-04-07] v1.4.0 [Feature] 增加自助更换服务器SSH端口功能
+# [2026-04-07] v1.4.0 [Fix] 全面修复 set -e 模式下管道与grep导致的意外退出隐患
 # [2026-01-30] v1.3.1 [Fix] 修复 Fail2ban 状态查看导致脚本退出的 bug (移除管道子shell的local声明)
 # [2026-01-30] v1.3 [Feature] 增加详细运行状态(PID/内存/时长)与日志智能翻译
 # [2026-01-30] v1.2 [Enhance] 优化输入容错(中文逗号)与状态颜色显示
@@ -46,11 +53,14 @@ check_root() {
 }
 
 # 检查并安装 UFW
+# 注意: set -e 下不能用 cmd && cmd2; if [ $? ]; 模式，需独立检测
 check_ufw() {
     if ! command -v ufw &> /dev/null; then
         echo -e "${YELLOW}未检测到 ufw，正在安装...${PLAIN}"
-        apt-get update && apt-get install -y ufw
-        if [ $? -ne 0 ]; then
+        apt-get update
+        apt-get install -y ufw
+        # 安装后再次检测，而非依赖退出码（set -e 已保证命令失败时退出）
+        if ! command -v ufw &> /dev/null; then
             echo -e "${RED}ufw 安装失败，请检查网络或源！${PLAIN}"
             exit 1
         fi
@@ -65,7 +75,7 @@ detect_ssh_port() {
     
     if [ -f "$SSH_CONFIG" ]; then
         local detected_port
-        detected_port=$(grep -E "^Port [0-9]+" "$SSH_CONFIG" | head -n 1 | awk '{print $2}')
+        detected_port=$(grep -E "^[[:space:]]*Port [0-9]+" "$SSH_CONFIG" | head -n 1 | awk '{print $2}' || true)
         if [[ -n "$detected_port" ]]; then
             port=$detected_port
             found_explicit=1
@@ -88,17 +98,20 @@ get_service_info() {
         pid=$(systemctl show -p MainPID --value "$svc")
         # 内存单位转换 (KB -> MB)
         if [[ -n "$pid" && "$pid" -ne 0 ]]; then
-            mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
+            mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.1f MB", $1/1024}' || true)
         else
             mem="未知"
         fi
         [ -z "$mem" ] && mem="未知"
         
-        # 运行时长
-        local start_ts now_ts diff
-        start_ts=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$svc")" +%s 2>/dev/null)
+        # 运行时长：防御 ActiveEnterTimestamp 返回空值导致的 date 崩溃
+        local start_ts now_ts diff ts_raw
+        ts_raw=$(systemctl show -p ActiveEnterTimestamp --value "$svc" 2>/dev/null || true)
         now_ts=$(date +%s)
-        if [[ -n "$start_ts" ]]; then
+        if [[ -n "$ts_raw" ]]; then
+            start_ts=$(date -d "$ts_raw" +%s 2>/dev/null || true)
+        fi
+        if [[ -n "${start_ts:-}" && "$start_ts" -gt 0 ]]; then
             diff=$((now_ts - start_ts))
             # 简单格式化为 "Xd Xh Xm"
             uptime=$(awk -v t="$diff" 'BEGIN{printf "%dd %dh %dm", t/86400, (t%86400)/3600, (t%3600)/60}')
@@ -159,7 +172,10 @@ ufw_basic_setup() {
     echo -e "检测到 SSH 端口为: ${GREEN}${ssh_port}${PLAIN}"
     
     # 检查 UFW 是否已有规则
-    if ufw status | grep -q -E "Status: active|To"; then
+    # 注意: pipefail 下 grep 不匹配返回 1 会触发退出，故用 grep ... || true
+    local ufw_has_config
+    ufw_has_config=$(ufw status 2>/dev/null | grep -E "Status: active|To" || true)
+    if [[ -n "$ufw_has_config" ]]; then
         echo -e "${YELLOW}检测到 UFW 已有配置或处于活动状态。${PLAIN}"
         read -p "是否重置所有规则并重新初始化? [y/N]: " reset_confirm
         if [[ "$reset_confirm" == "y" || "$reset_confirm" == "Y" ]]; then
@@ -306,7 +322,7 @@ ufw_sort_rules() {
     fi
 
     local rule_file="/tmp/ufw_rules.tmp"
-    ufw show added | grep '^ufw ' > "$rule_file"
+    ufw show added | grep '^ufw ' > "$rule_file" || true
     
     if [ ! -s "$rule_file" ]; then
         echo -e "${YELLOW}当前没有自定义规则，无需排序。${PLAIN}"
@@ -381,8 +397,11 @@ ufw_sort_rules() {
     while read -r rule_cmd; do
         if [[ -n "$rule_cmd" ]]; then
             echo "Applying: $rule_cmd"
-            $rule_cmd >/dev/null
-            ((count++))
+            # 安全执行（eval 可处理带引号的参数）; 直接 $rule_cmd 对带空格参数有风险
+            eval "$rule_cmd" >/dev/null
+            # ((count++)) 在 count=0 时其算术结果为 0（false），会触发 set -e 退出
+            # 改用 count=$((count + 1)) 规避此陷阱
+            count=$((count + 1))
         fi
     done < "${rule_file}.sorted"
     
@@ -540,9 +559,9 @@ fail2ban_config() {
         [ ! -f "$f" ] && return
         local val
         if grep -q "^\[DEFAULT\]" "$f"; then
-             val=$(sed -n '/^\[DEFAULT\]/,/^\[/p' "$f" | grep -E "^[[:space:]]*${k}[[:space:]]*=" | tail -n 1 | cut -d = -f 2- | tr -d '[:space:]')
+             val=$(sed -n '/^\[DEFAULT\]/,/^\[/p' "$f" | grep -E "^[[:space:]]*${k}[[:space:]]*=" | tail -n 1 | cut -d = -f 2- | tr -d '[:space:]' || true)
         else
-             val=$(grep -E "^[[:space:]]*${k}[[:space:]]*=" "$f" | tail -n 1 | cut -d = -f 2- | tr -d '[:space:]')
+             val=$(grep -E "^[[:space:]]*${k}[[:space:]]*=" "$f" | tail -n 1 | cut -d = -f 2- | tr -d '[:space:]' || true)
         fi
         echo "$val"
     }
@@ -630,24 +649,24 @@ ufw_status_detailed() {
     if [ -f /var/log/ufw.log ]; then
         tail -n 10 /var/log/ufw.log | while read -r line; do
              # 提取时间
-            ts=$(echo "$line" | awk '{print $1, $2, $3}')
+            ts=$(echo "$line" | awk '{print $1, $2, $3}' || true)
             # 提取 SRC IP
-            src_ip=$(echo "$line" | grep -oP 'SRC=\K[\d\.]+')
+            src_ip=$(echo "$line" | grep -oP 'SRC=\K[\d\.]+' || true)
             # 提取 DST Port
-            dst_port=$(echo "$line" | grep -oP 'DPT=\K\d+')
-            proto=$(echo "$line" | grep -oP 'PROTO=\K\w+')
+            dst_port=$(echo "$line" | grep -oP 'DPT=\K\d+' || true)
+            proto=$(echo "$line" | grep -oP 'PROTO=\K\w+' || true)
             
             if [[ -n "$src_ip" ]]; then
                  echo -e "${ts} -> ${RED}拦截${PLAIN} 来自 ${src_ip} (目标: ${dst_port}/${proto})"
             fi
-        done
+        done || true
     else
         # 尝试 dmesg
         echo "日志文件未找到，尝试系统消息(dmesg)..."
-        dmesg | grep '\[UFW BLOCK\]' | tail -n 5 | while read -r line; do
-             src_ip=$(echo "$line" | grep -oP 'SRC=\K[\d\.]+')
+        dmesg 2>/dev/null | grep '\[UFW BLOCK\]' | tail -n 5 | while read -r line; do
+             src_ip=$(echo "$line" | grep -oP 'SRC=\K[\d\.]+' || true)
              [[ -n "$src_ip" ]] && echo -e "${RED}拦截${PLAIN} 来自 ${src_ip}"
-        done
+        done || true
     fi
     read -p "按回车继续..." 
 }
@@ -669,10 +688,10 @@ fail2ban_status_detailed() {
         # 读取最后 10 行并分析（避免在管道子shell中使用 local）
         tail -n 10 /var/log/fail2ban.log | while read -r line; do
             # 提取时间 (前两列)
-            ts=$(echo "$line" | awk '{print $1, $2}')
+            ts=$(echo "$line" | awk '{print $1, $2}' || true)
             # 提取 Jail 和 IP
-            jail=$(echo "$line" | grep -oP '\[.*?\]' | head -1)
-            ip=$(echo "$line" | grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+            jail=$(echo "$line" | grep -oP '\[.*?\]' | head -1 || true)
+            ip=$(echo "$line" | grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' || true)
             
             # 翻译行为（不使用 local，避免子shell问题）
             action=""
@@ -701,6 +720,134 @@ fail2ban_status_detailed() {
 }
 
 # ==============================================================================
+# SSH 功能函数
+# ==============================================================================
+
+# 更换 SSH 端口
+change_ssh_port() {
+    echo -e "${YELLOW}>>> 准备更换 SSH 端口...${PLAIN}"
+    local old_port
+    old_port=$(detect_ssh_port)
+    echo -e "当前检测到 SSH 端口为: ${GREEN}${old_port}${PLAIN}"
+    
+    read -p "请输入新的 SSH 端口 (1024-65535, q取消): " new_port
+    if [[ "$new_port" == "q" || -z "$new_port" ]]; then echo "已取消"; return; fi
+    
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1024 ] || [ "$new_port" -gt 65535 ]; then
+        echo -e "${RED}错误：请输入 1024 到 65535 之间的有效端口号！${PLAIN}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    if [ "$new_port" -eq "$old_port" ]; then
+        echo -e "${YELLOW}新端口不能与当前端口相同！${PLAIN}"
+        read -p "按回车键返回..."
+        return
+    fi
+
+    echo -e "${RED}警告：此操作可能导致当前 SSH 连接中断！${PLAIN}"
+    echo -e "${YELLOW}提示：请务必确保新端口通畅，或具有备用登录通道。${PLAIN}"
+    read -p "确认将 SSH 端口更换为 $new_port ? [y/N]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then echo "已取消"; return; fi
+    
+    if [ ! -f "$SSH_CONFIG" ]; then
+        echo -e "${RED}错误: 找不到 SSH 配置文件 ${SSH_CONFIG}！${PLAIN}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    # --- 步骤 1: 备份并修改 sshd_config ---
+    local backup_file="${SSH_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$SSH_CONFIG" "$backup_file"
+    echo -e "已备份配置至 ${backup_file}"
+
+    # 注释掉现有未注释的 Port 行，再追加新端口
+    sed -E -i '/^[[:space:]]*Port[[:space:]]+[0-9]+/s/^/#/' "$SSH_CONFIG"
+    printf '\n# 修改添加的自定义 SSH 端口\nPort %s\n' "$new_port" >> "$SSH_CONFIG"
+    echo -e "${GREEN}sshd_config 已更新: Port → ${new_port}${PLAIN}"
+
+    # --- 步骤 2: 检测并处理 systemd socket 激活 ---
+    # 现代 Debian/Ubuntu 使用 ssh.socket 管理监听端口
+    # 即使重启 ssh.service，端口也由 systemd 持有，必须同步更新 socket 单元
+    local use_socket=0
+    local socket_unit=""
+    for s in ssh.socket sshd.socket; do
+        if systemctl list-unit-files --type=socket 2>/dev/null | grep -q "^${s}"; then
+            socket_unit="$s"
+            use_socket=1
+            break
+        fi
+    done
+
+    if [[ "$use_socket" -eq 1 ]]; then
+        echo -e "${YELLOW}检测到 systemd socket 激活模式 (${socket_unit})，正在更新 socket 监听端口...${PLAIN}"
+
+        local dropin_dir="/etc/systemd/system/${socket_unit}.d"
+        local dropin_file="${dropin_dir}/listen.conf"
+        mkdir -p "$dropin_dir"
+        # ListenStream= 第一行置空是必须的，用于清除默认值再追加新值
+        cat > "$dropin_file" << EOF
+[Socket]
+ListenStream=
+ListenStream=${new_port}
+EOF
+        echo -e "${GREEN}已创建 socket drop-in: ${dropin_file}${PLAIN}"
+
+        systemctl daemon-reload
+        echo -e "${YELLOW}正在重启 ${socket_unit} 和 SSH 服务...${PLAIN}"
+        systemctl restart "$socket_unit" 2>/dev/null || true
+        local svc_unit="${socket_unit%.socket}.service"
+        systemctl restart "$svc_unit" 2>/dev/null || true
+    else
+        # 传统模式：直接重启服务
+        echo -e "${YELLOW}传统模式，正在重启 SSH 服务...${PLAIN}"
+        local restart_ok=0
+        for svc_name in sshd ssh; do
+            if systemctl restart "$svc_name" 2>/dev/null; then
+                echo -e "${GREEN}SSH 服务 (${svc_name}) 重启成功！${PLAIN}"
+                restart_ok=1
+                break
+            fi
+        done
+        if [[ "$restart_ok" -eq 0 ]]; then
+            echo -e "${RED}警告: SSH 服务重启失败！配置已修改但服务未重载。${PLAIN}"
+            echo -e "${YELLOW}请手动执行: systemctl restart ssh 或 systemctl restart sshd${PLAIN}"
+            read -p "按回车键继续..."
+            return
+        fi
+    fi
+
+    # --- 步骤 3: UFW 放行新端口 ---
+    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "${YELLOW}正在为新端口添加 UFW 放行规则...${PLAIN}"
+        ufw allow "${new_port}/tcp"
+
+        read -p "是否从 UFW 中移除旧端口 ($old_port) 的入站规则？[y/N]: " del_old
+        if [[ "$del_old" == "y" || "$del_old" == "Y" ]]; then
+            ufw delete allow "${old_port}/tcp" 2>/dev/null || true
+            ufw delete allow "${old_port}" 2>/dev/null || true
+            echo -e "${GREEN}已尝试移除旧端口的放行规则。${PLAIN}"
+        fi
+    fi
+
+    # --- 步骤 4: 验证新端口是否真正开始监听 ---
+    sleep 1
+    if ss -tlnp 2>/dev/null | grep -qE ":${new_port}[[:space:]]"; then
+        echo -e "${GREEN}✓ 确认新端口 ${new_port} 已正常监听！${PLAIN}"
+    else
+        echo -e "${RED}✗ 警告: 新端口 ${new_port} 尚未监听！请排查以下信息:${PLAIN}"
+        echo -e "  sshd -t                            # 检查配置语法"
+        echo -e "  journalctl -u ssh -n 20 --no-pager # 查看服务日志"
+        echo -e "  ss -tlnp | grep ssh                # 查看当前监听状态"
+    fi
+
+    echo -e ""
+    echo -e "${GREEN}操作完成！${PLAIN}"
+    echo -e "${YELLOW}⚠ 请先开启新终端用端口 ${new_port} 测试登录，成功后再关闭当前连接！${PLAIN}"
+    read -p "按回车键继续..."
+}
+
+# ==============================================================================
 # 主菜单 (单页设计)
 # ==============================================================================
 
@@ -710,8 +857,8 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.3.1"
-        echo -e "========================================"
+        echo -e "      UFW & Fail2ban 一键管理 v1.4.3"
+        echo -e "========================================" 
         
         # 顶部状态栏
         local ufw_color ufw_text f2b_color f2b_text
@@ -749,9 +896,12 @@ show_menu() {
         echo -e "11. 封禁 IP          12. 解封 IP"
         echo -e "13. 修改策略         14. 卸载"
         echo -e "----------------------------------------"
+        echo -e "${SKYBLUE}[ 通用管理 ]${PLAIN}"
+        echo -e "15. 更换 SSH 端口"
+        echo -e "----------------------------------------"
         echo -e " 0. 退出"
         echo ""
-        read -p "请选择 [0-14]: " num
+        read -p "请选择 [0-15]: " num
         
         case "$num" in
             1) ufw_basic_setup ;;
@@ -796,6 +946,7 @@ show_menu() {
                 ;;
             13) fail2ban_config ;;
             14) fail2ban_uninstall ;;
+            15) change_ssh_port ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${PLAIN}"; sleep 1 ;;
         esac
