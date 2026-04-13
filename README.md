@@ -5,6 +5,13 @@
 
 sudo wget -O tcp.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcp.sh" && chmod +x tcp.sh && ./tcp.sh
 
+sudo wget -O smart_optimize.sh "https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/smart_optimize.sh" && chmod +x smart_optimize.sh && ./smart_optimize.sh
+
+sudo wget -O ufw-utils.sh "https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/ufw-utils.sh" && chmod +x ufw-utils.sh && ./ufw-utils.sh
+
+sudo wget -O xray-vless-ws-dual-v6.sh "https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/xray-vless-ws-dual-v6.sh" && chmod +x xray-vless-ws-dual-v6.sh && ./xray-vless-ws-dual-v6.sh
+
+
 sudo wget -P -N --no-check-certificate https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/ufw-utils.sh && chmod +x ufw-utils.sh && ./ufw-utils.sh
 
 sudo wget -P -N --no-check-certificate https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/smart_optimize.sh && chmod +x smart_optimize.sh && ./smart_optimize.sh
