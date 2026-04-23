@@ -11,6 +11,8 @@ sudo wget -O ufw-utils.sh "https://raw.githubusercontent.com/kirbyzhu/simplescri
 
 sudo wget -O xray-vless-ws-dual-v6.sh "https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/xray-vless-ws-dual-v6.sh" && chmod +x xray-vless-ws-dual-v6.sh && ./xray-vless-ws-dual-v6.sh
 
+sudo wget -O xray-vision-noblock.sh "https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/xray-vision-noblock.sh" && chmod +x xray-vision-noblock.sh && ./xray-vision-noblock.sh
+
 
 sudo wget -P -N --no-check-certificate https://raw.githubusercontent.com/kirbyzhu/simplescript/refs/heads/main/ufw-utils.sh && chmod +x ufw-utils.sh && ./ufw-utils.sh
 
