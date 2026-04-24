@@ -1,11 +1,16 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.4.5
+# ufw-utils.sh v1.5.0
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-24] v1.5.0 [Fix] 修复 UFW 放行端口后仍需 iptables 才能生效的问题:
+#                           1. 新增 Docker 环境检测与 DOCKER-USER 链兼容性修复
+#                           2. 初始化时检查 /etc/default/ufw 的 IPV6 设置并自动修正
+#                           3. 放行端口后强制 ufw reload 确保 iptables 立即同步
+#                           4. 新增 iptables 同步诊断功能，排查规则不一致问题
 # [2026-04-07] v1.4.5 [Fix] 修复 socket drop-in 只监听 IPv6: ListenStream 只写端口号时
 #                           systemd 默认绑定 [::]，IPv4 客户端无法连接。改为显式双栈监听
 # [2026-04-07] v1.4.4 [Fix] 修复 UFW 状态误报: oneshot 服务下 systemctl is-active 始终
@@ -35,10 +40,172 @@ PLAIN='\033[0m'
 # 全局变量
 SSH_CONFIG="/etc/ssh/sshd_config"
 FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
+UFW_DEFAULT="/etc/default/ufw"
+UFW_BEFORE_RULES="/etc/ufw/before.rules"
 
 # ==============================================================================
 # 基础检查函数
 # ==============================================================================
+
+# 检测 Docker 环境并修复 DOCKER-USER 链与 UFW 冲突
+# Docker 会在 iptables FORWARD 链中插入自己的规则，绕过 UFW 的管理
+# 当 Docker 容器映射端口到宿主机时，外部流量走 nat PREROUTING -> FORWARD 链
+# 而 UFW 只管理 INPUT 链，导致 UFW 声称已放行的端口实际不可达
+check_docker_compat() {
+    # 未安装 Docker 则无需处理
+    if ! command -v docker &> /dev/null && ! systemctl list-unit-files 2>/dev/null | grep -q 'docker.service'; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}检测到 Docker 环境，正在检查 UFW/Docker 兼容性...${PLAIN}"
+
+    # 检查 DOCKER-USER 链是否存在
+    if ! iptables -L DOCKER-USER -n &>/dev/null; then
+        echo -e "${YELLOW}DOCKER-USER 链尚不存在（Docker 可能未启动），暂时跳过。${PLAIN}"
+        return 0
+    fi
+
+    # 检查 /etc/ufw/after.rules 是否已配置 DOCKER-USER 链的回落规则
+    local after_rules="/etc/ufw/after.rules"
+    if [ -f "$after_rules" ] && grep -q 'DOCKER-USER' "$after_rules"; then
+        echo -e "${GREEN}Docker 兼容配置已存在于 after.rules 中。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}发现 Docker 绕过 UFW 问题！${PLAIN}"
+    echo -e "${YELLOW}Docker 的 DOCKER-USER 链会在 UFW INPUT 链之前匹配 FORWARD 流量，"
+    echo -e "导致 UFW 放行的端口对 Docker 容器无效。${PLAIN}"
+    echo -e ""
+    read -p "是否自动修复 Docker/UFW 兼容性? [y/N]: " fix_docker
+    if [[ "$fix_docker" != "y" && "$fix_docker" != "Y" ]]; then
+        echo -e "${YELLOW}跳过 Docker 兼容修复。如端口不通，请手动配置 DOCKER-USER 链。${PLAIN}"
+        return 0
+    fi
+
+    # 备份
+    cp -p "$after_rules" "${after_rules}.bak.$(date +%Y%m%d%H%M%S)"
+
+    # 在 after.rules 尾部追加 DOCKER-USER 链规则
+    # 这些规则确保 Docker 容器端口也受 UFW 管控
+    cat >> "$after_rules" <<'DOCKER_EOF'
+
+# ============================================================
+# Docker/UFW 兼容: 将 DOCKER-USER 链的流量引导至 UFW 过滤
+# 原理: Docker 的 FORWARD 链绕过 UFW 的 INPUT 管理，
+#       通过在 DOCKER-USER 链中插入 RETURN 前的 DROP 默认策略
+#       并显式放行 ESTABLISHED 连接和已 UFW 放行的端口
+# ============================================================
+*filter
+:DOCKER-USER - [0:0]
+# 已建立的连接直接放行（回包流量）
+-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# 容器间通信（docker0 网桥）直接放行
+-A DOCKER-USER -i docker0 -j ACCEPT
+# 来自外部网卡的 FORWARD 流量交由跳转到 ufw-user-input 链进行过滤
+# 这样 UFW 的 allow 规则才能对 Docker 映射端口生效
+-A DOCKER-USER -j ufw-user-input
+# 默认丢弃未匹配的 FORWARD 流量（安全兜底）
+-A DOCKER-USER -j DROP
+COMMIT
+DOCKER_EOF
+
+    echo -e "${GREEN}Docker 兼容规则已写入 ${after_rules}${PLAIN}"
+    echo -e "${YELLOW}正在重载 UFW 使规则生效...${PLAIN}"
+    ufw reload
+    echo -e "${GREEN}Docker/UFW 兼容修复完成！${PLAIN}"
+}
+
+# 检查 /etc/default/ufw 中 IPV6 是否启用（仅提示，不强制修改）
+# IPV6=no 会导致 UFW 不生成 ip6tables 规则，
+# 如果服务器确实不使用 IPv6 则无需处理，仅供知悉
+check_ipv6_setting() {
+    if [ ! -f "$UFW_DEFAULT" ]; then
+        return 0
+    fi
+
+    local ipv6_val
+    ipv6_val=$(grep -E '^IPV6=' "$UFW_DEFAULT" | cut -d= -f2 | tr -d '[:space:]' || true)
+
+    if [[ "$ipv6_val" == "no" ]]; then
+        echo -e "${YELLOW}提示: /etc/default/ufw 中 IPV6=no，UFW 未管理 IPv6 流量。${PLAIN}"
+        echo -e "${YELLOW}如服务器使用 IPv6，可手动修改为 IPV6=yes 后执行 ufw reload。${PLAIN}"
+    fi
+}
+
+# 诊断 UFW 规则与实际 iptables 状态的同步性
+# 用途: 当用户报告"UFW 显示放行但端口不通"时，此函数提供排查信息
+check_iptables_sync() {
+    echo -e "${SKYBLUE}>>> UFW / iptables 同步诊断${PLAIN}"
+    echo -e "========================================"
+
+    # 1. 检测 UFW 声明放行的端口
+    echo -e "\n${SKYBLUE}[1] UFW 已声明放行的端口:${PLAIN}"
+    ufw status | grep -E 'ALLOW' || echo "  (无)"
+
+    # 2. 检测 iptables 中 ufw-user-input 链的实际规则
+    echo -e "\n${SKYBLUE}[2] iptables ufw-user-input 链实际规则:${PLAIN}"
+    if iptables -L ufw-user-input -n --line-numbers 2>/dev/null; then
+        true
+    else
+        echo -e "  ${RED}ufw-user-input 链不存在！UFW 规则未加载到内核。${PLAIN}"
+        echo -e "  ${YELLOW}原因: UFW 可能未启用，或 iptables 被其他工具重置。${PLAIN}"
+    fi
+
+    # 3. 检测 Docker 相关链
+    echo -e "\n${SKYBLUE}[3] Docker 相关 iptables 链:${PLAIN}"
+    if iptables -L DOCKER-USER -n 2>/dev/null; then
+        true
+    else
+        echo "  DOCKER-USER 链不存在（非 Docker 环境或 Docker 未启动）"
+    fi
+
+    # 4. 检测 FORWARD 链默认策略
+    echo -e "\n${SKYBLUE}[4] FORWARD 链默认策略:${PLAIN}"
+    local fw_policy
+    fw_policy=$(iptables -L FORWARD -n 2>/dev/null | head -1 || true)
+    echo "  $fw_policy"
+    if echo "$fw_policy" | grep -q 'DROP'; then
+        echo -e "  ${YELLOW}FORWARD 默认 DROP — Docker 容器端口需要显式放行。${PLAIN}"
+    fi
+
+    # 5. 检测 raw 表 PREROUTING 链（某些 NAT VPS 的限制）
+    echo -e "\n${SKYBLUE}[5] raw 表 PREROUTING 链（NAT VPS conntrack 限制检测）:${PLAIN}"
+    if iptables -t raw -L PREROUTING -n 2>/dev/null | grep -vE '^(Chain|target)' | head -5; then
+        true
+    else
+        echo "  raw 表 PREROUTING 为空（正常）"
+    fi
+
+    # 6. 检测 conntrack 表状态
+    echo -e "\n${SKYBLUE}[6] conntrack 连接追踪表使用情况:${PLAIN}"
+    if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+        local ct_count ct_max
+        ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
+        ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max)
+        echo "  当前连接数: ${ct_count} / 最大值: ${ct_max}"
+        # conntrack 表满会导致新连接被静默丢弃
+        if [ "$ct_count" -gt $((ct_max * 80 / 100)) ]; then
+            echo -e "  ${RED}警告: conntrack 表使用率超过 80%！可能导致新连接被丢弃。${PLAIN}"
+            echo -e "  ${YELLOW}建议: sysctl -w net.netfilter.nf_conntrack_max=$((ct_max * 2))${PLAIN}"
+        fi
+    else
+        echo "  conntrack 模块未加载"
+    fi
+
+    echo -e "\n${SKYBLUE}[7] IPV6 支持状态:${PLAIN}"
+    if [ -f "$UFW_DEFAULT" ]; then
+        local ipv6_val
+        ipv6_val=$(grep -E '^IPV6=' "$UFW_DEFAULT" | cut -d= -f2 | tr -d '[:space:]' || true)
+        if [[ "$ipv6_val" == "yes" ]]; then
+            echo -e "  IPV6=${GREEN}yes${PLAIN}（正常）"
+        else
+            echo -e "  IPV6=${RED}${ipv6_val:-未设置}${PLAIN}（IPv6 流量不受 UFW 管控）"
+        fi
+    fi
+
+    echo -e "\n========================================"
+    read -p "按回车键继续..."
+}
 
 # 检查系统类型 (仅 Debian/Ubuntu)
 check_system() {
@@ -196,6 +363,12 @@ ufw_basic_setup() {
     echo -e "确保放行 SSH 端口: ${ssh_port}"
     ufw allow "${ssh_port}/tcp"
     
+    # 初始化时检查 IPv6 支持状态，避免 IPv6 流量绕过 UFW
+    check_ipv6_setting
+    
+    # 检测 Docker 兼容性，修复 DOCKER-USER 链绕过 UFW 的问题
+    check_docker_compat
+    
     echo -e "${GREEN}基础配置完成。${PLAIN}"
     if ! ufw status | grep -q "Status: active"; then
         echo -e "提示: UFW 目前处于 ${RED}inactive${PLAIN} 状态，请选择 [5] 启用。"
@@ -219,6 +392,10 @@ ufw_allow_port() {
     if [[ "$port_input" == "web" ]]; then
         ufw allow 80/tcp
         ufw allow 443/tcp
+        # Web 快捷命令同样需要 reload 确保立即生效
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw reload
+        fi
         echo -e "${GREEN}已放行 80/tcp 和 443/tcp${PLAIN}"
         read -p "按回车键继续..."
         return
@@ -234,6 +411,14 @@ ufw_allow_port() {
             ufw allow "$port"
         fi
     done
+    
+    # 强制重载 UFW 确保 iptables 规则立即同步到内核
+    # 某些发行版 (如 Debian 12) 的 UFW 后端在 allow 命令后不会
+    # 立即刷新内核 netfilter 规则表，导致新规则"纸面生效"但流量仍被拦截
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "${YELLOW}正在重载 UFW 以同步 iptables 规则...${PLAIN}"
+        ufw reload
+    fi
     
     echo -e "${GREEN}操作完成！${PLAIN}"
     read -p "按回车键继续..."
@@ -870,7 +1055,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.4.5"
+        echo -e "      UFW & Fail2ban 一键管理 v1.5.0"
         echo -e "========================================" 
         
         # 顶部状态栏
@@ -911,10 +1096,11 @@ show_menu() {
         echo -e "----------------------------------------"
         echo -e "${SKYBLUE}[ 通用管理 ]${PLAIN}"
         echo -e "15. 更换 SSH 端口"
+        echo -e "16. 诊断 iptables 同步"
         echo -e "----------------------------------------"
         echo -e " 0. 退出"
         echo ""
-        read -p "请选择 [0-15]: " num
+        read -p "请选择 [0-16]: " num
         
         case "$num" in
             1) ufw_basic_setup ;;
@@ -926,6 +1112,8 @@ show_menu() {
             5) 
                 echo "y" | ufw enable
                 echo -e "${GREEN}UFW 已启用${PLAIN}"
+                # 启用后检查 Docker 兼容性，确保 DOCKER-USER 链不会绕过 UFW
+                check_docker_compat
                 read -p "按回车继续..." 
                 ;;
             6) 
@@ -960,6 +1148,7 @@ show_menu() {
             13) fail2ban_config ;;
             14) fail2ban_uninstall ;;
             15) change_ssh_port ;;
+            16) check_iptables_sync ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${PLAIN}"; sleep 1 ;;
         esac
