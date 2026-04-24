@@ -621,7 +621,13 @@ func_configure_base() {
     [ -z "$uuid" ] && uuid="${d_uuid:-$new_uuid}"
     local transits="[]"
     [ -f "$USER_CONFIG" ] && transits=$(jq -r '.transit_nodes // []' "$USER_CONFIG")
-    func_apply_cert "$domain"
+    # 证书申请可能因端口占用/网络问题失败 (return 1)
+    # set -e 下不保护会导致整个脚本退出，用户被踢出菜单
+    if ! func_apply_cert "$domain"; then
+        echo -e "${RED}[ERROR] 证书申请失败，配置未完成。${NC}"
+        func_pause
+        return
+    fi
     cat > "$USER_CONFIG" <<EOF
 {
   "domain": "$domain",
