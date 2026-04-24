@@ -1,11 +1,15 @@
 #!/bin/bash
 
 # ====================================================
-# Xray Vision 一键部署脚本 v3.2 (No-Block 版)
+# Xray Vision 一键部署脚本 v3.3 (No-Block 版)
 # Author: Antigravity
 # Description: Pure VLESS-TCP-XTLS-Vision (移除所有国内流量拦截与路由限制)
 # ====================================================
 # 更新日志
+# v3.3 (2026-04-24)
+# - [Fix] 移除无效的 geoip.dat/geosite.dat 下载 (No-Block 版无 geo 路由规则，无需此数据)
+# - [Fix] 端口占用检测改为交互式：显示占用进程详情并提示是否杀进程
+# - [Fix] 证书申请前增加 80 端口占用检查，确保 acme.sh standalone 模式顺利运行
 # v3.2 (2026-02-22)
 # - [Fix] 修复 set -euo pipefail 下因 pgrep, getent 和 jq 异常返回导致的脚本意外退出
 # - [Safe] 增加卸载操作时的二次交互确认，防止误删配置文件和数据
@@ -62,11 +66,63 @@ func_is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+# 检查指定端口是否被占用，若占用则显示进程详情并询问是否杀掉
+# 参数: $1=端口号  $2=上下文描述(可选，用于提示信息)
 check_port_occupation() {
     local port=$1
-    if ss -tuln | grep -q ":$port "; then
-        echo -e "${RED}[ERROR] 端口 $port 被占用，请先释放该端口 (如: nginx/apache2)。${NC}"
-        exit 1
+    local context="${2:-}"
+    if ! ss -tuln | grep -q ":${port} "; then
+        return 0
+    fi
+
+    echo -e "${RED}[WARN] 端口 ${port} 已被占用！${NC}"
+    [ -n "$context" ] && echo -e "${YELLOW}场景: ${context}${NC}"
+
+    # 显示占用该端口的进程详情
+    echo -e "${CYAN}占用进程详情:${NC}"
+    ss -tulnp | grep ":${port} " || true
+    echo ""
+
+    # 提取占用该端口的 PID 列表
+    local pids
+    pids=$(ss -tulnp | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | sort -u || true)
+
+    if [ -z "$pids" ]; then
+        echo -e "${YELLOW}无法获取占用进程 PID，请手动释放端口 ${port}。${NC}"
+        return 1
+    fi
+
+    # 显示每个进程的详细信息
+    for pid in $pids; do
+        local proc_name
+        proc_name=$(ps -o comm= -p "$pid" 2>/dev/null || echo "unknown")
+        echo -e "  PID: ${RED}${pid}${NC}  进程: ${RED}${proc_name}${NC}"
+    done
+    echo ""
+
+    read -p "是否终止这些进程以释放端口 ${port}? [y/N]: " kill_confirm
+    if [[ "$kill_confirm" == "y" || "$kill_confirm" == "Y" ]]; then
+        for pid in $pids; do
+            echo -e "正在终止 PID ${pid}..."
+            kill "$pid" 2>/dev/null || true
+        done
+        # 等待端口释放
+        sleep 2
+        if ss -tuln | grep -q ":${port} "; then
+            echo -e "${YELLOW}端口仍被占用，尝试强制终止 (SIGKILL)...${NC}"
+            for pid in $pids; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 1
+        fi
+        if ss -tuln | grep -q ":${port} "; then
+            echo -e "${RED}[ERROR] 端口 ${port} 仍无法释放，请手动处理。${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}[OK] 端口 ${port} 已释放${NC}"
+    else
+        echo -e "${RED}端口 ${port} 未释放，操作中止。${NC}"
+        return 1
     fi
 }
 
@@ -152,10 +208,10 @@ func_install_core() {
     echo -e "${CYAN}====================================================${NC}"
     check_root
     
-    # 端口预检查
+    # 端口预检查: 仅在 caddy 未安装时检查（首次部署需要端口空闲）
     if ! command -v caddy >/dev/null; then
-        check_port_occupation 80
-        check_port_occupation 443
+        check_port_occupation 80 "Caddy 安装需要绑定 80 端口" || { func_pause; return; }
+        check_port_occupation 443 "Xray 需要绑定 443 端口" || { func_pause; return; }
     fi
 
     apt-get update
@@ -207,10 +263,8 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
     fi
-    mkdir -p /usr/local/share/xray
-    echo -e "${BLUE}[INFO]${NC} 更新 GeoData..."
-    curl -L -o /usr/local/share/xray/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat 2>/dev/null
-    curl -L -o /usr/local/share/xray/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat 2>/dev/null
+    # No-Block 版不使用 geoip/geosite 路由规则，跳过 GeoData 下载
+    # 如需启用 geo 路由，请切换到标准版脚本
     echo -e "${GREEN}[OK]${NC} 核心环境安装完成"
     func_pause
 }
@@ -504,7 +558,16 @@ func_apply_cert() {
         echo -e "${BLUE}[INFO]${NC} 注册 ZeroSSL 账户..."
         $acme --register-account -m "admin$((RANDOM%10000))@gmail.com" --server zerossl
     fi
+    # 停止可能占用 80 端口的已知服务
     systemctl stop caddy nginx >/dev/null 2>&1 || true
+    # 检查 80 端口是否仍被其他进程占用（acme.sh standalone 需要 80 端口）
+    if ss -tuln | grep -q ':80 '; then
+        echo -e "${YELLOW}[WARN] 停止 caddy/nginx 后，80 端口仍被占用${NC}"
+        check_port_occupation 80 "acme.sh standalone 证书申请需要 80 端口" || {
+            echo -e "${RED}[ERROR] 80 端口无法释放，证书申请中止。${NC}"
+            return 1
+        }
+    fi
     if $acme --issue -d "$domain" --standalone --server "$ca_server"; then
         echo -e "${GREEN}[OK]${NC} 证书申请成功"
         $acme --install-cert -d "$domain" \
@@ -881,7 +944,7 @@ func_uninstall() {
 func_menu() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    Xray Vision Manager v3.2 (No-Block) ║${NC}"
+    echo -e "${CYAN}║    Xray Vision Manager v3.3 (No-Block) ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
     echo ""
     echo "  1. 安装/更新环境"
