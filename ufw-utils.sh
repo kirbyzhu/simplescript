@@ -1,11 +1,18 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.5.0
+# ufw-utils.sh v1.6.0
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-28] v1.6.0 [Fix] 修复 SSH 端口更换后无法连接的 6 个 bug:
+#                           1. 修正操作顺序: UFW 放行新端口 → 重启 SSH（避免锁死）
+#                           2. 补充 ufw reload 确保 iptables 内核规则同步
+#                           3. 新增 sshd_config.d/ 子配置 Port 冲突检测与处理
+#                           4. 重启前执行 sshd -t 语法验证，失败自动回滚
+#                           5. 修正 socket 激活模式重启顺序（先停服务再重启 socket）
+#                           6. 自动同步 Fail2ban 监控端口
 # [2026-04-24] v1.5.0 [Fix] 修复 UFW 放行端口后仍需 iptables 才能生效的问题:
 #                           1. 新增 Docker 环境检测与 DOCKER-USER 链兼容性修复
 #                           2. 初始化时检查 /etc/default/ufw 的 IPV6 设置并自动修正
@@ -924,18 +931,26 @@ change_ssh_port() {
     local old_port
     old_port=$(detect_ssh_port)
     echo -e "当前检测到 SSH 端口为: ${GREEN}${old_port}${PLAIN}"
-    
+
     read -p "请输入新的 SSH 端口 (1024-65535, q取消): " new_port
     if [[ "$new_port" == "q" || -z "$new_port" ]]; then echo "已取消"; return; fi
-    
+
     if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1024 ] || [ "$new_port" -gt 65535 ]; then
         echo -e "${RED}错误：请输入 1024 到 65535 之间的有效端口号！${PLAIN}"
         read -p "按回车键返回..."
         return
     fi
-    
+
     if [ "$new_port" -eq "$old_port" ]; then
         echo -e "${YELLOW}新端口不能与当前端口相同！${PLAIN}"
+        read -p "按回车键返回..."
+        return
+    fi
+
+    # 检测新端口是否已被其他服务占用
+    if ss -tlnp 2>/dev/null | grep -qE ":${new_port}[[:space:]]"; then
+        echo -e "${RED}错误: 端口 ${new_port} 已被以下进程占用:${PLAIN}"
+        ss -tlnp 2>/dev/null | grep -E ":${new_port}[[:space:]]"
         read -p "按回车键返回..."
         return
     fi
@@ -944,26 +959,91 @@ change_ssh_port() {
     echo -e "${YELLOW}提示：请务必确保新端口通畅，或具有备用登录通道。${PLAIN}"
     read -p "确认将 SSH 端口更换为 $new_port ? [y/N]: " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then echo "已取消"; return; fi
-    
+
     if [ ! -f "$SSH_CONFIG" ]; then
         echo -e "${RED}错误: 找不到 SSH 配置文件 ${SSH_CONFIG}！${PLAIN}"
         read -p "按回车键返回..."
         return
     fi
-    
-    # --- 步骤 1: 备份并修改 sshd_config ---
+
+    # === 步骤 1: 备份 sshd_config ===
     local backup_file="${SSH_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
     cp -p "$SSH_CONFIG" "$backup_file"
     echo -e "已备份配置至 ${backup_file}"
 
+    # === 步骤 2: 检查并处理 sshd_config.d/ 子配置中的 Port 冲突 ===
+    # Debian 12+ 的 sshd_config 顶部有 Include /etc/ssh/sshd_config.d/*.conf
+    # OpenSSH 采用 first-match-wins 规则，子配置中的 Port 会覆盖主配置末尾追加的 Port
+    local include_conflict=0
+    local conflict_file=""
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        for conf_file in /etc/ssh/sshd_config.d/*.conf; do
+            [ -f "$conf_file" ] || continue
+            if grep -qE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$conf_file"; then
+                include_conflict=1
+                conflict_file="$conf_file"
+                break
+            fi
+        done
+    fi
+
+    if [[ "$include_conflict" -eq 1 ]]; then
+        echo -e "${YELLOW}检测到子配置 ${conflict_file} 中存在 Port 指令！${PLAIN}"
+        echo -e "${YELLOW}OpenSSH first-match-wins 规则下，该指令会覆盖主配置中的修改。${PLAIN}"
+        read -p "是否自动注释该子配置中的 Port 行? [Y/n]: " fix_include
+        if [[ "$fix_include" != "n" && "$fix_include" != "N" ]]; then
+            cp -p "$conflict_file" "${conflict_file}.bak.$(date +%Y%m%d%H%M%S)"
+            sed -E -i '/^[[:space:]]*Port[[:space:]]+[0-9]+/s/^/# /' "$conflict_file"
+            echo -e "${GREEN}已注释 ${conflict_file} 中的 Port 指令。${PLAIN}"
+        else
+            echo -e "${RED}警告: 子配置冲突未解决，端口修改可能无效！${PLAIN}"
+        fi
+    fi
+
+    # === 步骤 3: 修改 sshd_config ===
     # 注释掉现有未注释的 Port 行，再追加新端口
     sed -E -i '/^[[:space:]]*Port[[:space:]]+[0-9]+/s/^/#/' "$SSH_CONFIG"
     printf '\n# 修改添加的自定义 SSH 端口\nPort %s\n' "$new_port" >> "$SSH_CONFIG"
     echo -e "${GREEN}sshd_config 已更新: Port → ${new_port}${PLAIN}"
 
-    # --- 步骤 2: 检测并处理 systemd socket 激活 ---
-    # 现代 Debian/Ubuntu 使用 ssh.socket 管理监听端口
-    # 即使重启 ssh.service，端口也由 systemd 持有，必须同步更新 socket 单元
+    # === 步骤 4: sshd -t 语法验证（失败则自动回滚）===
+    # 在重启服务前验证配置，防止语法错误导致 SSH 不可用
+    echo -e "${YELLOW}正在验证 SSH 配置语法...${PLAIN}"
+    local sshd_test_output
+    if ! sshd_test_output=$(sshd -t 2>&1); then
+        echo -e "${RED}SSH 配置验证失败！错误信息:${PLAIN}"
+        echo "$sshd_test_output"
+        echo -e "${YELLOW}正在自动回滚配置...${PLAIN}"
+        cp -p "$backup_file" "$SSH_CONFIG"
+        # 如果修改了子配置也需要回滚
+        if [[ "$include_conflict" -eq 1 ]]; then
+            local latest_bak
+            latest_bak=$(ls -t "${conflict_file}.bak."* 2>/dev/null | head -1 || true)
+            if [ -n "$latest_bak" ]; then
+                cp -p "$latest_bak" "$conflict_file"
+            fi
+        fi
+        echo -e "${GREEN}配置已回滚至修改前状态。${PLAIN}"
+        read -p "按回车键返回..."
+        return
+    fi
+    echo -e "${GREEN}✓ SSH 配置语法验证通过${PLAIN}"
+
+    # === 步骤 5: UFW 放行新端口（必须在重启 SSH 之前！）===
+    # 关键修复: 如果先重启 SSH 再放行端口，SSH 已切换到新端口监听，
+    # 但 UFW 仍拦截新端口 —— 当前会话一旦断开，用户将被永久锁死
+    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "${YELLOW}正在为新端口添加 UFW 放行规则...${PLAIN}"
+        ufw allow "${new_port}/tcp"
+        # 强制重载 UFW 确保 iptables 规则立即同步到内核
+        # Debian 12 的 UFW 后端在 allow 命令后可能不刷新 netfilter 规则表
+        echo -e "${YELLOW}正在重载 UFW 以同步 iptables 规则...${PLAIN}"
+        ufw reload
+        echo -e "${GREEN}✓ UFW 已放行端口 ${new_port}/tcp 并同步至内核${PLAIN}"
+    fi
+
+    # === 步骤 6: 重启 SSH 服务 ===
+    # 检测并处理 systemd socket 激活模式
     local use_socket=0
     local socket_unit=""
     for s in ssh.socket sshd.socket; do
@@ -992,10 +1072,14 @@ EOF
         echo -e "${GREEN}已创建 socket drop-in: ${dropin_file}${PLAIN}"
 
         systemctl daemon-reload
-        echo -e "${YELLOW}正在重启 ${socket_unit} 和 SSH 服务...${PLAIN}"
-        systemctl restart "$socket_unit" 2>/dev/null || true
+        echo -e "${YELLOW}正在重启 SSH socket 和服务...${PLAIN}"
+        # 正确顺序: 先停服务 → 再重启 socket（socket 按需唤起服务）
         local svc_unit="${socket_unit%.socket}.service"
-        systemctl restart "$svc_unit" 2>/dev/null || true
+        systemctl stop "$svc_unit" 2>/dev/null || true
+        if ! systemctl restart "$socket_unit" 2>&1; then
+            echo -e "${RED}警告: ${socket_unit} 重启失败！${PLAIN}"
+            journalctl -u "$socket_unit" --no-pager -n 5
+        fi
     else
         # 传统模式：直接重启服务
         echo -e "${YELLOW}传统模式，正在重启 SSH 服务...${PLAIN}"
@@ -1015,21 +1099,11 @@ EOF
         fi
     fi
 
-    # --- 步骤 3: UFW 放行新端口 ---
-    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        echo -e "${YELLOW}正在为新端口添加 UFW 放行规则...${PLAIN}"
-        ufw allow "${new_port}/tcp"
-
-        read -p "是否从 UFW 中移除旧端口 ($old_port) 的入站规则？[y/N]: " del_old
-        if [[ "$del_old" == "y" || "$del_old" == "Y" ]]; then
-            ufw delete allow "${old_port}/tcp" 2>/dev/null || true
-            ufw delete allow "${old_port}" 2>/dev/null || true
-            echo -e "${GREEN}已尝试移除旧端口的放行规则。${PLAIN}"
-        fi
-    fi
-
-    # --- 步骤 4: 验证新端口是否真正开始监听 ---
-    sleep 1
+    # === 步骤 7: 验证新端口是否真正开始监听 ===
+    # socket 激活模式可能需要稍长的启动时间
+    local verify_wait=3
+    echo -e "${YELLOW}等待 ${verify_wait} 秒后验证端口监听状态...${PLAIN}"
+    sleep "$verify_wait"
     if ss -tlnp 2>/dev/null | grep -qE ":${new_port}[[:space:]]"; then
         echo -e "${GREEN}✓ 确认新端口 ${new_port} 已正常监听！${PLAIN}"
     else
@@ -1037,6 +1111,32 @@ EOF
         echo -e "  sshd -t                            # 检查配置语法"
         echo -e "  journalctl -u ssh -n 20 --no-pager # 查看服务日志"
         echo -e "  ss -tlnp | grep ssh                # 查看当前监听状态"
+    fi
+
+    # === 步骤 8: 同步 Fail2ban 端口配置 ===
+    # 换端口后 Fail2ban 仍监控旧端口，新端口上的暴力破解不会被检测
+    if [ -f "$FAIL2BAN_JAIL" ] && systemctl is-active --quiet fail2ban 2>/dev/null; then
+        echo -e "${YELLOW}正在同步 Fail2ban 监控端口...${PLAIN}"
+        if grep -A5 '^\[sshd\]' "$FAIL2BAN_JAIL" | grep -qE '^[[:space:]]*port[[:space:]]*='; then
+            # 替换 [sshd] 段下已有的 port 行
+            sed -i "/^\[sshd\]/,/^\[/{s/^[[:space:]]*port[[:space:]]*=.*/port = ${new_port}/}" "$FAIL2BAN_JAIL"
+        else
+            # 在 [sshd] 段下方追加 port 配置
+            sed -i "/^\[sshd\]/a port = ${new_port}" "$FAIL2BAN_JAIL"
+        fi
+        systemctl restart fail2ban 2>/dev/null || true
+        echo -e "${GREEN}✓ Fail2ban 已更新为监控端口 ${new_port}${PLAIN}"
+    fi
+
+    # === 步骤 9: 可选清理旧端口 UFW 规则 ===
+    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        read -p "是否从 UFW 中移除旧端口 ($old_port) 的入站规则？[y/N]: " del_old
+        if [[ "$del_old" == "y" || "$del_old" == "Y" ]]; then
+            ufw delete allow "${old_port}/tcp" 2>/dev/null || true
+            ufw delete allow "${old_port}" 2>/dev/null || true
+            ufw reload
+            echo -e "${GREEN}已移除旧端口的放行规则并重载防火墙。${PLAIN}"
+        fi
     fi
 
     echo -e ""
@@ -1055,7 +1155,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.5.0"
+        echo -e "      UFW & Fail2ban 一键管理 v1.6.0"
         echo -e "========================================" 
         
         # 顶部状态栏
