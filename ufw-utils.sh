@@ -1,11 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.7.2
+# ufw-utils.sh v1.7.3
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-29] v1.7.3 [Feature] 增加 SSH 端口修复模式 (允许输入同端口强制重置并清理冲突配置)
 # [2026-04-29] v1.7.2 [Fix] 修复部分系统下手跑 sshd -t 报 Missing privilege separation directory 错误的问题
 # [2026-04-29] v1.7.1 [Fix] 终极防御性审查加固 SSH 端口更改逻辑:
 #                           1. 修复 Subshell 导致的回滚变量作用域丢失问题
@@ -972,19 +973,27 @@ change_ssh_port() {
         return 1
     fi
 
+    local is_repair_mode=0
     if [ "$new_port" -eq "$old_port" ]; then
-        echo -e "${YELLOW}新端口不能与当前端口相同！${PLAIN}"
-        read -p "按回车键返回..."
-        return 1
+        echo -e "${YELLOW}提示：您输入的新端口与当前检测到的端口 ($old_port) 相同。${PLAIN}"
+        read -p "是否要强制重新应用此端口的配置 (进入修复模式，重置所有 SSH 端口相关设置)？[y/N]: " force_repair
+        if [[ "$force_repair" == "y" || "$force_repair" == "Y" ]]; then
+            is_repair_mode=1
+        else
+            echo "已取消"
+            return 1
+        fi
     fi
 
-    # 精确检测新端口是否已被其他服务占用
-    if ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); if(a[length(a)]==port) found=1} END{exit !found}' port="$new_port"; then
-        echo -e "${RED}错误: 端口 ${new_port} 已被以下进程占用:${PLAIN}"
-        ss -tlnp 2>/dev/null | head -1
-        ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); if(a[length(a)]==port) print}' port="$new_port"
-        read -p "按回车键返回..."
-        return 1
+    # 只有在非修复模式下才检测端口占用，修复模式下该端口本就被 SSH 占用
+    if [[ "$is_repair_mode" -eq 0 ]]; then
+        if ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); if(a[length(a)]==port) found=1} END{exit !found}' port="$new_port"; then
+            echo -e "${RED}错误: 端口 ${new_port} 已被以下进程占用:${PLAIN}"
+            ss -tlnp 2>/dev/null | head -1
+            ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); if(a[length(a)]==port) print}' port="$new_port"
+            read -p "按回车键返回..."
+            return 1
+        fi
     fi
 
     echo -e "${RED}警告：此操作可能导致当前 SSH 连接中断！${PLAIN}"
@@ -1312,7 +1321,8 @@ SOCKETEOF
     fi
 
     # === 步骤 10: 可选清理旧端口 UFW 规则 ===
-    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    # 修复模式下新旧端口相同，跳过此步以防误删刚添加的规则
+    if [[ "$is_repair_mode" -eq 0 ]] && command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         read -p "是否从 UFW 中移除旧端口 ($old_port) 的入站规则？[y/N]: " del_old
         if [[ "$del_old" == "y" || "$del_old" == "Y" ]]; then
             ufw delete allow "${old_port}/tcp" 2>/dev/null || true
@@ -1345,7 +1355,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.7.2"
+        echo -e "      UFW & Fail2ban 一键管理 v1.7.3"
         echo -e "========================================" 
         
         # 顶部状态栏
