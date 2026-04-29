@@ -1,11 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.7.3
+# ufw-utils.sh v1.7.4
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-29] v1.7.4 [Fix] 修复 Socket 检测逻辑过宽导致误启 socket 激活模式的问题 (只检测 active/enabled)
 # [2026-04-29] v1.7.3 [Feature] 增加 SSH 端口修复模式 (允许输入同端口强制重置并清理冲突配置)
 # [2026-04-29] v1.7.2 [Fix] 修复部分系统下手跑 sshd -t 报 Missing privilege separation directory 错误的问题
 # [2026-04-29] v1.7.1 [Fix] 终极防御性审查加固 SSH 端口更改逻辑:
@@ -1191,7 +1192,8 @@ PORTEOF
     local use_socket=0
     local socket_unit=""
     for s in ssh.socket sshd.socket; do
-        if systemctl list-unit-files --type=socket 2>/dev/null | grep -q "^${s}"; then
+        # 严格判断：只有当 socket 处于 enabled 或 active 状态时，才认为系统在使用 socket 激活模式
+        if systemctl is-enabled --quiet "$s" 2>/dev/null || systemctl is-active --quiet "$s" 2>/dev/null; then
             socket_unit="$s"
             use_socket=1
             break
@@ -1355,7 +1357,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.7.3"
+        echo -e "      UFW & Fail2ban 一键管理 v1.7.4"
         echo -e "========================================" 
         
         # 顶部状态栏
