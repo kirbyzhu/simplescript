@@ -1,11 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.7.4
+# ufw-utils.sh v1.7.5
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-29] v1.7.5 [Feature] 添加一键清理甲骨文原生 iptables 冲突规则的功能，非 Oracle VPS 亦安全兼容
 # [2026-04-29] v1.7.4 [Fix] 修复 Socket 检测逻辑过宽导致误启 socket 激活模式的问题 (只检测 active/enabled)
 # [2026-04-29] v1.7.3 [Feature] 增加 SSH 端口修复模式 (允许输入同端口强制重置并清理冲突配置)
 # [2026-04-29] v1.7.2 [Fix] 修复部分系统下手跑 sshd -t 报 Missing privilege separation directory 错误的问题
@@ -1348,6 +1349,68 @@ SOCKETEOF
 }
 
 # ==============================================================================
+# 底层维护功能
+# ==============================================================================
+
+# 修复甲骨文云/云厂商自带的防火墙规则冲突
+fix_oracle_firewall() {
+    echo -e "${YELLOW}>>> 准备清理云服务商自带的冲突防火墙规则 (如甲骨文云默认的 iptables 拦截规则)...${PLAIN}"
+    
+    # 1. 禁用并卸载冲突的持久化工具
+    # 只有当安装了这些包时才执行卸载，避免在非甲骨文VPS上产生报错
+    local pkgs_to_remove=""
+    if dpkg -l 2>/dev/null | grep -q "^ii.*iptables-persistent "; then
+        pkgs_to_remove="iptables-persistent"
+    fi
+    if dpkg -l 2>/dev/null | grep -q "^ii.*netfilter-persistent "; then
+        pkgs_to_remove="$pkgs_to_remove netfilter-persistent"
+    fi
+    
+    if [ -n "$pkgs_to_remove" ]; then
+        echo -e "${YELLOW}检测到冲突组件: ${pkgs_to_remove}，正在卸载以防止重启后规则冲突...${PLAIN}"
+        systemctl stop netfilter-persistent iptables-persistent 2>/dev/null || true
+        systemctl disable netfilter-persistent iptables-persistent 2>/dev/null || true
+        apt-get remove --purge -y $pkgs_to_remove
+        rm -rf /etc/iptables
+        echo -e "${GREEN}✓ 冲突的持久化工具已彻底清理。${PLAIN}"
+    else
+        echo -e "${GREEN}✓ 未检测到 iptables-persistent / netfilter-persistent 等冲突包。${PLAIN}"
+    fi
+
+    # 2. 清理当前内存中残留的 REJECT 规则 (特别针对甲骨文)
+    echo -e "${YELLOW}正在扫描并清理内存中的默认拦截规则...${PLAIN}"
+    local rule_deleted=0
+    # 循环删除直到没有该规则为止（避免 set -e 导致退出）
+    while iptables -C INPUT -j REJECT --reject-with icmp-host-prohibited 2>/dev/null; do
+        iptables -D INPUT -j REJECT --reject-with icmp-host-prohibited 2>/dev/null || break
+        rule_deleted=1
+    done
+    while iptables -C FORWARD -j REJECT --reject-with icmp-host-prohibited 2>/dev/null; do
+        iptables -D FORWARD -j REJECT --reject-with icmp-host-prohibited 2>/dev/null || break
+        rule_deleted=1
+    done
+    
+    if [ "$rule_deleted" -eq 1 ]; then
+        echo -e "${GREEN}✓ 成功清除了内核中残留的默认 REJECT 拦截规则。${PLAIN}"
+    else
+        echo -e "${GREEN}✓ 内核中未发现冲突的 REJECT 拦截规则。${PLAIN}"
+    fi
+    
+    # 3. 重新交接权力给 UFW
+    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "${YELLOW}正在重载 UFW 规则使其全面接管...${PLAIN}"
+        ufw reload >/dev/null 2>&1 || true
+        echo -e "${GREEN}✓ UFW 规则已重载，防火墙接管完毕。${PLAIN}"
+    else
+        echo -e "${YELLOW}⚠ UFW 当前未启用，建议您随后开启 UFW 以保护服务器。${PLAIN}"
+    fi
+    
+    echo -e ""
+    echo -e "${GREEN}操作完成！原生规则冲突已排查清理完毕，非甲骨文机器也已得到安全确认。${PLAIN}"
+    read -p "按回车键继续..."
+}
+
+# ==============================================================================
 # 主菜单 (单页设计)
 # ==============================================================================
 
@@ -1357,7 +1420,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.7.4"
+        echo -e "      UFW & Fail2ban 一键管理 v1.7.5"
         echo -e "========================================" 
         
         # 顶部状态栏
@@ -1399,10 +1462,11 @@ show_menu() {
         echo -e "${SKYBLUE}[ 通用管理 ]${PLAIN}"
         echo -e "15. 更换 SSH 端口"
         echo -e "16. 诊断 iptables 同步"
+        echo -e "17. 清理原生规则 (甲骨文云专属修复)"
         echo -e "----------------------------------------"
         echo -e " 0. 退出"
         echo ""
-        read -p "请选择 [0-16]: " num
+        read -p "请选择 [0-17]: " num
         
         case "$num" in
             1) ufw_basic_setup ;;
@@ -1451,6 +1515,7 @@ show_menu() {
             14) fail2ban_uninstall ;;
             15) change_ssh_port ;;
             16) check_iptables_sync ;;
+            17) fix_oracle_firewall ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${PLAIN}"; sleep 1 ;;
         esac
