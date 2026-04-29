@@ -1,11 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# ufw-utils.sh v1.7.1
+# ufw-utils.sh v1.7.2
 # 描述: UFW 防火墙与 Fail2ban 一键管理脚本 (单页菜单版)
 # 支持: Ubuntu/Debian (需支持 UFW)
 # 作者: Agent (Based on user request)
 # ------------------------------------------------------------------------------
 # 变更记录:
+# [2026-04-29] v1.7.2 [Fix] 修复部分系统下手跑 sshd -t 报 Missing privilege separation directory 错误的问题
 # [2026-04-29] v1.7.1 [Fix] 终极防御性审查加固 SSH 端口更改逻辑:
 #                           1. 修复 Subshell 导致的回滚变量作用域丢失问题
 #                           2. 增加对 sed, cat, mkdir, printf, ufw 等核心操作的全局异常捕获
@@ -1146,6 +1147,11 @@ PORTEOF
 
     # === 步骤 5: sshd -t 语法验证 ===
     echo -e "${YELLOW}正在验证 SSH 配置语法...${PLAIN}"
+    # 修复: 部分系统 (Debian/Ubuntu) 的 /run/sshd 是 systemd 动态创建的
+    # 手动执行 sshd -t 若目录不存在会报 Missing privilege separation directory 导致误判
+    if [ ! -d /run/sshd ]; then
+        mkdir -p /run/sshd 2>/dev/null || true
+    fi
     local sshd_test_output
     if ! sshd_test_output=$(sshd -t 2>&1); then
         echo -e "${RED}SSH 配置验证失败！错误信息:${PLAIN}"
@@ -1339,7 +1345,7 @@ show_menu() {
     while true; do
         clear
         echo -e "========================================"
-        echo -e "      UFW & Fail2ban 一键管理 v1.7.1"
+        echo -e "      UFW & Fail2ban 一键管理 v1.7.2"
         echo -e "========================================" 
         
         # 顶部状态栏
